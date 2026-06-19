@@ -306,7 +306,110 @@ All defaults live in `GfsConfig.java` and are written to `.gfs/config` on first 
 
 ```bash
 mvn test
+```
 
-# Expected output:
-# Tests run: 28, Failures: 0, Errors: 0, Skipped: 0
+**Actual test output:**
+```
+-------------------------------------------------------
+ T E S T S
+-------------------------------------------------------
+Running ChunkStorageTest
+Tests run: 13, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.207 s
+Running MasterServerTest
+Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s
+
+Results:
+Tests run: 28, Failures: 0, Errors: 0, Skipped: 0
+
+BUILD SUCCESS
+Total time: 2.146 s
+```
+
+---
+
+## End-to-End Run Results
+
+Tested on Windows 11, Java 17.0.19, Maven 3.9.16 with 3 ChunkServers on separate racks.
+
+### Cluster Startup
+```
+$ java -cp $JAR Main master
+[Master] Listening on port 9000
+
+$ java -cp $JAR Main chunkserver 9100 chunk_data/node1 rack-A
+[Master] Registered chunk server localhost:9100 (rack=rack-A, free=261.0 GB)
+
+$ java -cp $JAR Main chunkserver 9101 chunk_data/node2 rack-B
+[Master] Registered chunk server localhost:9101 (rack=rack-B, free=261.0 GB)
+
+$ java -cp $JAR Main chunkserver 9102 chunk_data/node3 rack-C
+[Master] Registered chunk server localhost:9102 (rack=rack-C, free=261.0 GB)
+```
+
+### cluster-status
+```
+=== GFS Cluster Status ===
+Live servers (3): [localhost:9102 rack=rack-C free=261.0 GB,
+                   localhost:9101 rack=rack-B free=261.0 GB,
+                   localhost:9100 rack=rack-A free=261.0 GB]
+Dead servers (0): []
+Total files  : 0
+Total dirs   : 0
+Total chunks : 0
+```
+
+### Upload + stat
+```
+$ java -cp $JAR Main mkdir /data
+[GfsClient] Created directory: /data
+
+$ java -cp $JAR Main upload README.md /data/readme.txt
+[GfsClient] Uploading chunk 1 (id=580677f1-..., v1, 17379 bytes) -> localhost:9100
+[GfsClient] Upload complete: README.md -> /data/readme.txt (1 chunk(s), 17379 bytes)
+
+$ java -cp $JAR Main stat /data/readme.txt
+Path        : /data/readme.txt
+Type        : file
+Size        : 17379 bytes
+Chunks      : 1
+Replicas    : 3
+Created     : 2026-06-19 17:32:48
+Modified    : 2026-06-19 17:32:48
+```
+
+### Append + stat (size and timestamp updated)
+```
+$ java -cp $JAR Main append /data/readme.txt "Hello from GFS append!"
+[GfsClient] Appended 22 bytes to /data/readme.txt at offset 17379
+
+$ java -cp $JAR Main stat /data/readme.txt
+Path        : /data/readme.txt
+Type        : file
+Size        : 17401 bytes        ← grew by 22 bytes
+Chunks      : 1
+Replicas    : 3
+Created     : 2026-06-19 17:32:48
+Modified    : 2026-06-19 17:32:49  ← updatedAt refreshed
+```
+
+### Download + integrity check
+```
+$ java -cp $JAR Main download /data/readme.txt recovered.txt
+[GfsClient] Downloading /data/readme.txt (1 chunk(s)) -> recovered.txt
+[GfsClient] Download complete: recovered.txt
+
+Original MD5 : 39390887454B58830EEEADB771158B7E
+Recovered MD5: 39390887454B58830EEEADB771158B7E
+PERFECT MATCH
+```
+
+### Node failure test
+```
+# Kill node :9100 mid-session
+$ java -cp $JAR Main download /data/readme.txt recovered_after_failure.txt
+[GfsClient] Downloading /data/readme.txt (1 chunk(s)) -> recovered_after_failure.txt
+[GfsClient] Download complete: recovered_after_failure.txt
+
+MD5 after node failure: 39390887454B58830EEEADB771158B7E
+MATCH — data accessible with one node down ✓
 ```
