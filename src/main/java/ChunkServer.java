@@ -11,21 +11,23 @@ import java.util.zip.CRC32;
  * Mirrors how ObjectStore.java bundles all object read/write/compress logic
  * in the reference DVCS project. All chunk-server concerns live here:
  *   - Local disk storage (one flat file per chunk, named by UUID)
- *   - CRC32 checksums stored alongside each chunk for integrity verification
- *   - Read / write / delete / append request handling
+ *   - Version sidecar (.ver) per chunk for stale replica detection
+ *   - CRC32 checksum sidecar (.crc) per chunk for integrity verification
+ *   - Read / write / append / delete / verify request handling
  *   - Replication forwarding to secondary servers
- *   - Heartbeat sender to keep the Master updated
+ *   - Heartbeat with chunk version map sent to Master
+ *   - Lease renewal requests before the 60 s window expires
  *
- * GFS paper responsibilities:
+ * GFS paper responsibilities (§2.6, §3, §4):
  *   - Store chunks as flat files
+ *   - Report chunk versions in heartbeats so Master can evict stale replicas
  *   - Serve read/write/append from clients (primary chains to secondaries)
  *   - Detect and report data corruption via checksums
- *   - Send periodic heartbeats carrying the local chunk list
  */
 public class ChunkServer {
 
     // -------------------------------------------------------------------------
-    // Storage — flat files on local disk, one file per chunk + .crc sidecar
+    // Storage — flat files; .crc and .ver sidecars alongside each chunk
     // -------------------------------------------------------------------------
 
     static class ChunkStorage {
@@ -36,14 +38,14 @@ public class ChunkServer {
             Files.createDirectories(this.dir);
         }
 
-        void write(String chunkId, byte[] data) throws IOException {
+        void write(String chunkId, byte[] data, long version) throws IOException {
             Files.write(dir.resolve(chunkId), data,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
             writeCrc(chunkId, computeCrc(data));
+            writeVersion(chunkId, version);
         }
 
-        // Atomic record append — appends data to the chunk file
-        void append(String chunkId, byte[] data) throws IOException {
+        void append(String chunkId, byte[] data, long version) throws IOException {
             Path p = dir.resolve(chunkId);
             byte[] existing = Files.exists(p) ? Files.readAllBytes(p) : new byte[0];
             byte[] combined = new byte[existing.length + data.length];
@@ -51,6 +53,7 @@ public class ChunkServer {
             System.arraycopy(data, 0, combined, existing.length, data.length);
             Files.write(p, combined, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
             writeCrc(chunkId, computeCrc(combined));
+            writeVersion(chunkId, version);
         }
 
         byte[] read(String chunkId) throws IOException {
@@ -64,6 +67,7 @@ public class ChunkServer {
         void delete(String chunkId) throws IOException {
             Files.deleteIfExists(dir.resolve(chunkId));
             Files.deleteIfExists(dir.resolve(chunkId + ".crc"));
+            Files.deleteIfExists(dir.resolve(chunkId + ".ver"));
         }
 
         boolean has(String chunkId) {
@@ -75,18 +79,32 @@ public class ChunkServer {
             return Files.exists(p) ? Files.size(p) : 0;
         }
 
-        Set<String> list() throws IOException {
-            Set<String> chunks = new HashSet<>();
+        long readVersion(String chunkId) {
+            try {
+                Path p = dir.resolve(chunkId + ".ver");
+                return Files.exists(p) ? Long.parseLong(Files.readString(p).trim()) : 1L;
+            } catch (IOException e) { return 1L; }
+        }
+
+        // Returns chunkId -> version map for all stored chunks (sent in heartbeat)
+        Map<String, Long> listWithVersions() throws IOException {
+            Map<String, Long> result = new HashMap<>();
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
                 for (Path entry : stream) {
                     String name = entry.getFileName().toString();
-                    if (!name.endsWith(".crc")) chunks.add(name);
+                    if (!name.endsWith(".crc") && !name.endsWith(".ver"))
+                        result.put(name, readVersion(name));
                 }
             }
-            return chunks;
+            return result;
         }
 
-        // CRC32 checksum helpers — detect silent data corruption
+        Set<String> list() throws IOException {
+            return listWithVersions().keySet();
+        }
+
+        // ---- sidecar helpers ----
+
         private long computeCrc(byte[] data) {
             CRC32 crc = new CRC32();
             crc.update(data);
@@ -101,11 +119,16 @@ public class ChunkServer {
         private void verifyCrc(String chunkId, byte[] data) throws IOException {
             Path crcFile = dir.resolve(chunkId + ".crc");
             if (!Files.exists(crcFile)) return;
-            long stored  = Long.parseLong(Files.readString(crcFile).trim());
+            long stored   = Long.parseLong(Files.readString(crcFile).trim());
             long computed = computeCrc(data);
             if (stored != computed)
                 throw new IOException("Checksum mismatch for chunk " + chunkId +
                     " (stored=" + stored + ", computed=" + computed + ")");
+        }
+
+        private void writeVersion(String chunkId, long version) throws IOException {
+            Files.writeString(dir.resolve(chunkId + ".ver"), String.valueOf(version),
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         }
     }
 
@@ -129,12 +152,13 @@ public class ChunkServer {
 
                 Message req = (Message) in.readObject();
                 switch (req.type) {
-                    case "WRITE_CHUNK":     handleWrite(req, out);   break;
-                    case "APPEND_CHUNK":    handleAppend(req, out);  break;
-                    case "READ_CHUNK":      handleRead(req, out);    break;
-                    case "DELETE_CHUNK":    handleDelete(req, out);  break;
-                    case "VERIFY_CHUNK":    handleVerify(req, out);  break;
-                    case "REPLICATE_CHUNK": handleReplicate(req, out); break;
+                    case "WRITE_CHUNK":     handleWrite(req, out);    break;
+                    case "APPEND_CHUNK":    handleAppend(req, out);   break;
+                    case "READ_CHUNK":      handleRead(req, out);     break;
+                    case "DELETE_CHUNK":    handleDelete(req, out);   break;
+                    case "VERIFY_CHUNK":    handleVerify(req, out);   break;
+                    case "REPLICATE_CHUNK":
+                    case "REPLICATE_APPEND":handleReplicate(req, out); break;
                     default:
                         out.writeObject(Message.error("Unknown: " + req.type));
                 }
@@ -148,29 +172,27 @@ public class ChunkServer {
         private void handleWrite(Message req, ObjectOutputStream out) throws IOException {
             String chunkId = (String) req.get("chunkId");
             byte[] data    = (byte[]) req.get("data");
-            storage.write(chunkId, data);
+            long   version = req.has("version") ? ((Number) req.get("version")).longValue() : 1L;
+            storage.write(chunkId, data, version);
 
-            // chain replication to secondaries (GFS primary-push model)
-            List<MasterServer.ChunkLocation> secondaries =
-                req.has("secondaries") ? (List<MasterServer.ChunkLocation>) req.get("secondaries") : new ArrayList<>();
-            for (MasterServer.ChunkLocation loc : secondaries) {
-                replicateTo("REPLICATE_CHUNK", chunkId, data, loc);
-            }
+            List<MasterServer.ChunkLocation> secondaries = getSecondaries(req);
+            for (MasterServer.ChunkLocation loc : secondaries)
+                replicateTo("REPLICATE_CHUNK", chunkId, data, version, loc);
+
             out.writeObject(Message.ok().put("chunkId", chunkId));
         }
 
         private void handleAppend(Message req, ObjectOutputStream out) throws IOException {
             String chunkId = (String) req.get("chunkId");
             byte[] data    = (byte[]) req.get("data");
-            long offset    = storage.size(chunkId);
-            storage.append(chunkId, data);
+            long   version = req.has("version") ? ((Number) req.get("version")).longValue() : 1L;
+            long   offset  = storage.size(chunkId);
+            storage.append(chunkId, data, version);
 
-            // forward append to secondaries
-            List<MasterServer.ChunkLocation> secondaries =
-                req.has("secondaries") ? (List<MasterServer.ChunkLocation>) req.get("secondaries") : new ArrayList<>();
-            for (MasterServer.ChunkLocation loc : secondaries) {
-                replicateTo("REPLICATE_APPEND", chunkId, data, loc);
-            }
+            List<MasterServer.ChunkLocation> secondaries = getSecondaries(req);
+            for (MasterServer.ChunkLocation loc : secondaries)
+                replicateTo("REPLICATE_APPEND", chunkId, data, version, loc);
+
             out.writeObject(Message.ok().put("chunkId", chunkId).put("offset", offset));
         }
 
@@ -188,7 +210,7 @@ public class ChunkServer {
         private void handleVerify(Message req, ObjectOutputStream out) throws IOException {
             String chunkId = (String) req.get("chunkId");
             try {
-                storage.read(chunkId); // triggers CRC check
+                storage.read(chunkId);
                 out.writeObject(Message.ok().put("chunkId", chunkId).put("valid", true));
             } catch (IOException e) {
                 out.writeObject(Message.ok().put("chunkId", chunkId).put("valid", false)
@@ -199,27 +221,37 @@ public class ChunkServer {
         private void handleReplicate(Message req, ObjectOutputStream out) throws IOException {
             String chunkId = (String) req.get("chunkId");
             byte[] data    = (byte[]) req.get("data");
+            long   version = req.has("version") ? ((Number) req.get("version")).longValue() : 1L;
             if ("REPLICATE_APPEND".equals(req.type)) {
-                storage.append(chunkId, data);
+                storage.append(chunkId, data, version);
             } else {
-                storage.write(chunkId, data);
+                storage.write(chunkId, data, version);
             }
             out.writeObject(Message.ok());
         }
 
-        private void replicateTo(String msgType, String chunkId, byte[] data, MasterServer.ChunkLocation loc) {
+        private void replicateTo(String msgType, String chunkId, byte[] data,
+                                 long version, MasterServer.ChunkLocation loc) {
             try (Socket s   = new Socket(loc.host, loc.port);
                  ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
                  ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
 
                 out.writeObject(new Message(msgType)
                     .put("chunkId", chunkId)
-                    .put("data", data));
-                in.readObject(); // consume ACK
+                    .put("data", data)
+                    .put("version", version));
+                in.readObject();
                 System.out.println("[ChunkServer] Replicated " + chunkId + " -> " + loc);
             } catch (Exception e) {
                 System.err.println("[ChunkServer] Replication to " + loc + " failed: " + e.getMessage());
             }
+        }
+
+        @SuppressWarnings("unchecked")
+        private List<MasterServer.ChunkLocation> getSecondaries(Message req) {
+            return req.has("secondaries")
+                ? (List<MasterServer.ChunkLocation>) req.get("secondaries")
+                : new ArrayList<>();
         }
     }
 
@@ -230,9 +262,12 @@ public class ChunkServer {
     private final String host;
     private final int port;
     private final ChunkStorage storage;
-    private final ExecutorService pool      = Executors.newCachedThreadPool();
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService pool = Executors.newCachedThreadPool();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private volatile boolean running;
+
+    // Tracks chunks this server is primary for, with lease expiry time
+    private final Map<String, Long> primaryLeases = new ConcurrentHashMap<>();
 
     public ChunkServer(String host, int port, String storageDir) throws IOException {
         this.host    = host;
@@ -244,6 +279,7 @@ public class ChunkServer {
         running = true;
         registerWithMaster();
         scheduleHeartbeats();
+        scheduleLeaseRenewals();
         System.out.println("[ChunkServer] Listening on " + host + ":" + port);
         try (ServerSocket ss = new ServerSocket(port)) {
             while (running) {
@@ -267,12 +303,46 @@ public class ChunkServer {
             TimeUnit.MILLISECONDS);
     }
 
+    // Lease renewal: if we hold a primary lease expiring within 10 s, renew it
+    private void scheduleLeaseRenewals() {
+        scheduler.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, Long> entry : primaryLeases.entrySet()) {
+                long expiresAt = entry.getValue();
+                if (expiresAt - now < 10_000) { // renew 10 s before expiry
+                    renewLease(entry.getKey());
+                }
+            }
+        }, 5000, 5000, TimeUnit.MILLISECONDS);
+    }
+
+    private void renewLease(String chunkId) {
+        try (Socket s   = new Socket(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT);
+             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+             ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+
+            out.writeObject(new Message("RENEW_LEASE")
+                .put("chunkId", chunkId)
+                .put("primary", new MasterServer.ChunkLocation(host, port)));
+            Message resp = (Message) in.readObject();
+            if ("OK".equals(resp.type)) {
+                long newExpiry = ((Number) resp.get("leaseExpiry")).longValue();
+                primaryLeases.put(chunkId, newExpiry);
+            } else {
+                primaryLeases.remove(chunkId); // revoked by master
+            }
+        } catch (Exception e) {
+            System.err.println("[ChunkServer] Lease renewal failed for " + chunkId + ": " + e.getMessage());
+        }
+    }
+
     private Message buildHeartbeat(String type) {
         try {
+            Map<String, Long> versions = storage.listWithVersions();
             return new Message(type)
                 .put("host", host)
                 .put("port", port)
-                .put("chunks", storage.list());
+                .put("chunkVersions", versions); // versions map sent instead of plain chunk set
         } catch (IOException e) {
             return new Message(type).put("host", host).put("port", port);
         }
@@ -283,7 +353,7 @@ public class ChunkServer {
              ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
              ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
             out.writeObject(msg);
-            in.readObject(); // consume ACK
+            in.readObject();
         } catch (Exception e) {
             System.err.println("[ChunkServer] Master contact failed: " + e.getMessage());
         }
