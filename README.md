@@ -86,6 +86,7 @@ src/
 | **RPC retry with backoff** | §4 | Master RPCs, chunk writes, replication, and lease renewals retry up to 3 times with linear backoff (500 ms × attempt) before failing |
 | **Safe lease renewal** | §5.4 | Transient network errors during lease renewal no longer revoke the lease — only an explicit master rejection does |
 | **Node rejoin reconciliation** | §4.4, §4.5 | On every heartbeat the Master reconciles reported chunks: valid replicas (version matches) are re-admitted to the replica list immediately; orphaned chunks (file deleted while node was offline) are garbage-collected via `DELETE_CHUNK` |
+| **Consistent file metadata** | §2.6 | `fileSize` and `updatedAt` kept in sync on both upload and append via `UPDATE_FILE_SIZE` / `NOTIFY_APPEND` RPCs; `stat` reports only live chunk count (excludes evicted chunks); orphaned file entries (created but never written) are removed after a 60 s grace period |
 
 ## Quick Start
 

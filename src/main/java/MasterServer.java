@@ -227,9 +227,10 @@ public class MasterServer {
         // 2. Replay op log entries written after the checkpoint
         replayOpLog(checkpointTime);
 
-        // 3. Schedule periodic checkpoint + re-replication checks
+        // 3. Schedule periodic checkpoint, re-replication, and orphan cleanup
         scheduleCheckpoint();
         scheduleReReplication();
+        scheduleOrphanCleanup();
 
         System.out.println("[Master] Listening on port " + port);
         try (ServerSocket ss = new ServerSocket(port)) {
@@ -281,6 +282,31 @@ public class MasterServer {
             try { opLog.truncate(); } catch (IOException ignored) {}
         }, GfsConfig.CHECKPOINT_INTERVAL_MS,
            GfsConfig.CHECKPOINT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Orphan file cleanup — removes file entries that were created but never
+     * had any chunks written (e.g. client crashed after CREATE_FILE but before
+     * the first REQUEST_CHUNK_WRITE).  A 60-second grace period avoids racing
+     * with slow but legitimate uploads.
+     */
+    private void scheduleOrphanCleanup() {
+        scheduler.scheduleAtFixedRate(() -> {
+            long cutoff = System.currentTimeMillis() - GfsConfig.ORPHAN_GRACE_PERIOD_MS;
+            List<String> orphans = namespace.entrySet().stream()
+                .filter(e -> {
+                    FileMetadata m = e.getValue();
+                    return !m.isDirectory && m.chunkIds.isEmpty() && m.createdAt < cutoff;
+                })
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+
+            for (String path : orphans) {
+                namespace.remove(path);
+                opLog.append("ORPHAN_CLEANUP", path);
+                System.out.printf("[Master] Removed orphaned file entry: %s (created but never written)%n", path);
+            }
+        }, 60000, 60000, TimeUnit.MILLISECONDS);
     }
 
     // Background re-replication (GFS §4.4)
@@ -372,6 +398,7 @@ public class MasterServer {
             case "REQUEST_CHUNK_READ":    return requestChunkRead(req);
             case "RENEW_LEASE":           return renewLease(req);
             case "UPDATE_FILE_SIZE":      return updateFileSize(req);
+            case "NOTIFY_APPEND":         return notifyAppend(req);
             case "REGISTER_CHUNK_SERVER": return registerServer(req);
             case "HEARTBEAT":             return heartbeat(req);
             case "CLUSTER_STATUS":        return clusterStatus(req);
@@ -468,16 +495,29 @@ public class MasterServer {
         FileMetadata meta = namespace.get(path);
         if (meta == null) return Message.error("No such file or directory: " + path);
 
-        int totalReplicas = meta.chunkIds.stream()
-            .mapToInt(id -> chunkTable.containsKey(id) ? chunkTable.get(id).locations.size() : 0)
+        // Count only chunks that actually exist in chunkTable (excludes evicted chunks)
+        long liveChunks = meta.chunkIds.stream()
+            .filter(chunkTable::containsKey)
+            .count();
+
+        // Count live replicas (servers that are currently reachable)
+        int liveReplicas = meta.chunkIds.stream()
+            .filter(chunkTable::containsKey)
+            .mapToInt(id -> {
+                ChunkMetadata cm = chunkTable.get(id);
+                return (int) cm.locations.stream()
+                    .filter(loc -> { ServerInfo si = servers.get(loc.toString()); return si != null && si.isAlive(); })
+                    .count();
+            })
             .sum();
 
         return new Message("STAT")
             .put("path", meta.path)
             .put("isDirectory", meta.isDirectory)
             .put("fileSize", meta.fileSize)
-            .put("chunkCount", meta.chunkIds.size())
-            .put("totalReplicas", totalReplicas)
+            .put("chunkCount", liveChunks)
+            .put("totalChunkIds", meta.chunkIds.size())
+            .put("totalReplicas", liveReplicas)
             .put("createdAt", meta.createdAt)
             .put("updatedAt", meta.updatedAt);
     }
@@ -488,6 +528,16 @@ public class MasterServer {
         if (meta == null) return Message.error("File not found: " + path);
         meta.fileSize  = ((Number) req.get("fileSize")).longValue();
         meta.updatedAt = System.currentTimeMillis();
+        return Message.ok();
+    }
+
+    private Message notifyAppend(Message req) {
+        String path = (String) req.get("path");
+        FileMetadata meta = namespace.get(path);
+        if (meta == null) return Message.error("File not found: " + path);
+        long appendedBytes = ((Number) req.get("appendedBytes")).longValue();
+        meta.fileSize  += appendedBytes;
+        meta.updatedAt  = System.currentTimeMillis();
         return Message.ok();
     }
 

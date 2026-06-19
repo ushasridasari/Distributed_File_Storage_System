@@ -147,8 +147,8 @@ public class GfsClient {
         MasterServer.ChunkLocation primary    = (MasterServer.ChunkLocation) lease.get("primary");
         List<MasterServer.ChunkLocation> secs = getSecondaries(lease);
 
-        try (Socket s   = new Socket(primary.host, primary.port);
-             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+        Socket s = newSocket(primary.host, primary.port);
+        try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
              ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
 
             out.writeObject(new Message("APPEND_CHUNK")
@@ -160,12 +160,18 @@ public class GfsClient {
             if ("ERROR".equals(resp.type))
                 throw new IOException("Append failed: " + resp.get("error"));
             long offset = resp.has("offset") ? ((Number) resp.get("offset")).longValue() : 0L;
+
+            // Keep file metadata consistent: update size and modification time on Master
+            sendToMaster(new Message("NOTIFY_APPEND")
+                .put("path", gfsPath)
+                .put("appendedBytes", (long) data.length));
+
             System.out.printf("[GfsClient] Appended %d bytes to %s at offset %d%n",
                 data.length, gfsPath, offset);
             return offset;
         } catch (ClassNotFoundException e) {
             throw new IOException("Deserialization error", e);
-        }
+        } finally { try { s.close(); } catch (IOException ignored) {} }
     }
 
     public void deleteFile(String gfsPath) throws IOException {
@@ -196,10 +202,13 @@ public class GfsClient {
         if ("ERROR".equals(resp.type)) throw new IOException(resp.get("error").toString());
 
         SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        long liveChunks  = ((Number) resp.get("chunkCount")).longValue();
+        long totalChunks = resp.has("totalChunkIds") ? ((Number) resp.get("totalChunkIds")).longValue() : liveChunks;
         System.out.println("Path        : " + resp.get("path"));
         System.out.println("Type        : " + (Boolean.TRUE.equals(resp.get("isDirectory")) ? "directory" : "file"));
         System.out.println("Size        : " + resp.get("fileSize") + " bytes");
-        System.out.println("Chunks      : " + resp.get("chunkCount"));
+        System.out.println("Chunks      : " + liveChunks +
+            (totalChunks != liveChunks ? " (" + (totalChunks - liveChunks) + " evicted)" : ""));
         System.out.println("Replicas    : " + resp.get("totalReplicas"));
         System.out.println("Created     : " + sdf.format(new Date(((Number) resp.get("createdAt")).longValue())));
         System.out.println("Modified    : " + sdf.format(new Date(((Number) resp.get("updatedAt")).longValue())));
