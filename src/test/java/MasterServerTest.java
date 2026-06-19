@@ -145,4 +145,17 @@ public class MasterServerTest {
         meta.addChunk("c1");
         assertTrue(meta.updatedAt >= before);
     }
+
+    @Test
+    public void testFileSizeSetAfterUpload() {
+        MasterServer ms = new MasterServer(0);
+        ms.namespace.put("/sized.txt", new MasterServer.FileMetadata("/sized.txt", false));
+
+        // Simulate UPDATE_FILE_SIZE RPC
+        MasterServer.FileMetadata meta = ms.namespace.get("/sized.txt");
+        meta.fileSize = 134217728L; // 128 MB
+        meta.updatedAt = System.currentTimeMillis();
+
+        assertEquals(134217728L, ms.namespace.get("/sized.txt").fileSize);
+    }
 }

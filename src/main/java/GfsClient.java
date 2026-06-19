@@ -72,28 +72,51 @@ public class GfsClient {
         Message createResp = sendToMaster(new Message("CREATE_FILE").put("path", gfsPath));
         if ("ERROR".equals(createResp.type)) throw new IOException(createResp.get("error").toString());
 
-        byte[] fileBytes = readAllBytes(file);
-        int totalChunks  = Math.max(1, (int) Math.ceil((double) fileBytes.length / GfsConfig.CHUNK_SIZE_BYTES));
+        // Stream the file one 64 MB chunk at a time — never loads the entire file into heap
+        byte[] buffer = new byte[GfsConfig.CHUNK_SIZE_BYTES];
+        long totalBytes = 0;
+        int chunkIndex  = 0;
 
-        for (int i = 0; i < totalChunks; i++) {
-            int    start     = i * GfsConfig.CHUNK_SIZE_BYTES;
-            int    end       = Math.min(start + GfsConfig.CHUNK_SIZE_BYTES, fileBytes.length);
-            byte[] chunkData = Arrays.copyOfRange(fileBytes, start, end);
+        try (FileInputStream fis = new FileInputStream(file)) {
+            int bytesRead;
+            while ((bytesRead = fis.read(buffer)) != -1) {
+                // Avoid holding a full-size buffer reference for partial last chunks
+                byte[] chunkData = (bytesRead < buffer.length)
+                    ? Arrays.copyOf(buffer, bytesRead) : buffer;
 
+                Message lease = sendToMaster(new Message("REQUEST_CHUNK_WRITE").put("path", gfsPath));
+                if ("ERROR".equals(lease.type)) throw new IOException(lease.get("error").toString());
+
+                String chunkId  = (String) lease.get("chunkId");
+                long   version  = lease.has("version") ? ((Number) lease.get("version")).longValue() : 1L;
+                MasterServer.ChunkLocation primary    = (MasterServer.ChunkLocation) lease.get("primary");
+                List<MasterServer.ChunkLocation> secs = getSecondaries(lease);
+
+                System.out.printf("[GfsClient] Uploading chunk %d (id=%s, v%d, %d bytes) -> %s%n",
+                    chunkIndex + 1, chunkId, version, bytesRead, primary);
+                writeChunk(primary, secs, chunkId, version, chunkData);
+                totalBytes += bytesRead;
+                chunkIndex++;
+            }
+        }
+
+        // Empty file: still allocate one (empty) chunk so the path exists in GFS
+        if (chunkIndex == 0) {
             Message lease = sendToMaster(new Message("REQUEST_CHUNK_WRITE").put("path", gfsPath));
             if ("ERROR".equals(lease.type)) throw new IOException(lease.get("error").toString());
-
             String chunkId  = (String) lease.get("chunkId");
             long   version  = lease.has("version") ? ((Number) lease.get("version")).longValue() : 1L;
             MasterServer.ChunkLocation primary    = (MasterServer.ChunkLocation) lease.get("primary");
             List<MasterServer.ChunkLocation> secs = getSecondaries(lease);
-
-            System.out.printf("[GfsClient] Uploading chunk %d/%d (id=%s, v%d) -> %s%n",
-                i + 1, totalChunks, chunkId, version, primary);
-            writeChunk(primary, secs, chunkId, version, chunkData);
+            writeChunk(primary, secs, chunkId, version, new byte[0]);
+            chunkIndex = 1;
         }
-        System.out.printf("[GfsClient] Upload complete: %s -> %s (%d chunk(s))%n",
-            localPath, gfsPath, totalChunks);
+
+        // Inform Master of the actual file size so stat() returns the correct value
+        sendToMaster(new Message("UPDATE_FILE_SIZE").put("path", gfsPath).put("fileSize", totalBytes));
+
+        System.out.printf("[GfsClient] Upload complete: %s -> %s (%d chunk(s), %d bytes)%n",
+            localPath, gfsPath, chunkIndex, totalBytes);
     }
 
     public void download(String gfsPath, String localPath) throws IOException {
@@ -289,13 +312,4 @@ public class GfsClient {
             : new ArrayList<>();
     }
 
-    // -------------------------------------------------------------------------
-    // Utility
-    // -------------------------------------------------------------------------
-
-    private byte[] readAllBytes(File file) throws IOException {
-        try (FileInputStream fis = new FileInputStream(file)) {
-            return fis.readAllBytes();
-        }
-    }
 }

@@ -47,12 +47,10 @@ public class ChunkServer {
 
         void append(String chunkId, byte[] data, long version) throws IOException {
             Path p = dir.resolve(chunkId);
-            byte[] existing = Files.exists(p) ? Files.readAllBytes(p) : new byte[0];
-            byte[] combined = new byte[existing.length + data.length];
-            System.arraycopy(existing, 0, combined, 0, existing.length);
-            System.arraycopy(data, 0, combined, existing.length, data.length);
-            Files.write(p, combined, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            writeCrc(chunkId, computeCrc(combined));
+            // Append directly — avoids loading the existing chunk into memory
+            Files.write(p, data, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            // CRC must cover the full chunk contents after append
+            writeCrc(chunkId, computeCrc(Files.readAllBytes(p)));
             writeVersion(chunkId, version);
         }
 

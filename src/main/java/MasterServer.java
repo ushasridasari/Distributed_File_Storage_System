@@ -369,6 +369,7 @@ public class MasterServer {
             case "REQUEST_CHUNK_APPEND":  return requestChunkAppend(req);
             case "REQUEST_CHUNK_READ":    return requestChunkRead(req);
             case "RENEW_LEASE":           return renewLease(req);
+            case "UPDATE_FILE_SIZE":      return updateFileSize(req);
             case "REGISTER_CHUNK_SERVER": return registerServer(req);
             case "HEARTBEAT":             return heartbeat(req);
             case "CLUSTER_STATUS":        return clusterStatus(req);
@@ -477,6 +478,15 @@ public class MasterServer {
             .put("totalReplicas", totalReplicas)
             .put("createdAt", meta.createdAt)
             .put("updatedAt", meta.updatedAt);
+    }
+
+    private Message updateFileSize(Message req) {
+        String path = (String) req.get("path");
+        FileMetadata meta = namespace.get(path);
+        if (meta == null) return Message.error("File not found: " + path);
+        meta.fileSize  = ((Number) req.get("fileSize")).longValue();
+        meta.updatedAt = System.currentTimeMillis();
+        return Message.ok();
     }
 
     // -------------------------------------------------------------------------
