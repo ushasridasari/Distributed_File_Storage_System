@@ -18,6 +18,12 @@ public class GfsConfig {
     public static final long   LEASE_DURATION_MS        = 60000;  // chunk lease valid for 60 s (GFS paper §5.4)
     public static final long   CHECKPOINT_INTERVAL_MS   = 300000; // master checkpoint every 5 min
 
+    // Network reliability
+    public static final int    SOCKET_CONNECT_TIMEOUT_MS = 5000;  // max time to establish a TCP connection
+    public static final int    SOCKET_READ_TIMEOUT_MS    = 30000; // max time to wait for a response
+    public static final int    RPC_MAX_RETRIES           = 3;     // attempts before giving up
+    public static final long   RPC_RETRY_DELAY_MS        = 500;   // base delay; multiplied by attempt number
+
     private static final String CONFIG_FILE = ".gfs/config";
 
     public static void createDefaultConfig() throws IOException {

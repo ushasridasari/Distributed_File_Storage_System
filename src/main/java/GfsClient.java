@@ -226,28 +226,40 @@ public class GfsClient {
     private void writeChunk(MasterServer.ChunkLocation primary,
                             List<MasterServer.ChunkLocation> secondaries,
                             String chunkId, long version, byte[] data) throws IOException {
-        try (Socket s   = new Socket(primary.host, primary.port);
-             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
-             ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
-
-            out.writeObject(new Message("WRITE_CHUNK")
-                .put("chunkId", chunkId)
-                .put("version", version)
-                .put("data", data)
-                .put("secondaries", secondaries));
-            Message resp = (Message) in.readObject();
-            if ("ERROR".equals(resp.type))
-                throw new IOException("Write failed: " + resp.get("error"));
-        } catch (ClassNotFoundException e) {
-            throw new IOException("Deserialization error", e);
+        IOException last = null;
+        for (int attempt = 1; attempt <= GfsConfig.RPC_MAX_RETRIES; attempt++) {
+            try {
+                Socket s = newSocket(primary.host, primary.port);
+                try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+                     ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+                    out.writeObject(new Message("WRITE_CHUNK")
+                        .put("chunkId", chunkId)
+                        .put("version", version)
+                        .put("data", data)
+                        .put("secondaries", secondaries));
+                    Message resp = (Message) in.readObject();
+                    if ("ERROR".equals(resp.type))
+                        throw new IOException("Write failed: " + resp.get("error"));
+                    return;
+                } finally { try { s.close(); } catch (IOException ignored) {} }
+            } catch (ClassNotFoundException e) {
+                throw new IOException("Deserialization error", e);
+            } catch (IOException e) {
+                last = e;
+                if (attempt < GfsConfig.RPC_MAX_RETRIES) {
+                    System.err.printf("[GfsClient] Write attempt %d/%d failed (%s), retrying...%n",
+                        attempt, GfsConfig.RPC_MAX_RETRIES, e.getMessage());
+                    sleep(GfsConfig.RPC_RETRY_DELAY_MS * attempt);
+                }
+            }
         }
+        throw new IOException("Write failed after " + GfsConfig.RPC_MAX_RETRIES + " attempts", last);
     }
 
     private byte[] readChunk(MasterServer.ChunkLocation loc, String chunkId) throws IOException {
-        try (Socket s   = new Socket(loc.host, loc.port);
-             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+        Socket s = newSocket(loc.host, loc.port);
+        try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
              ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
-
             out.writeObject(new Message("READ_CHUNK").put("chunkId", chunkId));
             Message resp = (Message) in.readObject();
             if ("ERROR".equals(resp.type))
@@ -255,7 +267,7 @@ public class GfsClient {
             return (byte[]) resp.get("data");
         } catch (ClassNotFoundException e) {
             throw new IOException("Deserialization error", e);
-        }
+        } finally { try { s.close(); } catch (IOException ignored) {} }
     }
 
     // Try each replica in order; skip stale/dead ones (GFS §3.1)
@@ -291,18 +303,43 @@ public class GfsClient {
     }
 
     // -------------------------------------------------------------------------
-    // Master RPC helper
+    // Master RPC helper — with retry + timeout
     // -------------------------------------------------------------------------
 
     private Message sendToMaster(Message msg) throws IOException {
-        try (Socket s   = new Socket(masterHost, masterPort);
-             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
-             ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
-            out.writeObject(msg);
-            return (Message) in.readObject();
-        } catch (ClassNotFoundException e) {
-            throw new IOException("Deserialization error", e);
+        IOException last = null;
+        for (int attempt = 1; attempt <= GfsConfig.RPC_MAX_RETRIES; attempt++) {
+            try {
+                Socket s = newSocket(masterHost, masterPort);
+                try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+                     ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+                    out.writeObject(msg);
+                    return (Message) in.readObject();
+                } catch (ClassNotFoundException e) {
+                    throw new IOException("Deserialization error", e);
+                } finally { try { s.close(); } catch (IOException ignored) {} }
+            } catch (IOException e) {
+                last = e;
+                if (attempt < GfsConfig.RPC_MAX_RETRIES) {
+                    System.err.printf("[GfsClient] Master RPC attempt %d/%d failed (%s), retrying...%n",
+                        attempt, GfsConfig.RPC_MAX_RETRIES, e.getMessage());
+                    sleep(GfsConfig.RPC_RETRY_DELAY_MS * attempt);
+                }
+            }
         }
+        throw new IOException("Master unreachable after " + GfsConfig.RPC_MAX_RETRIES + " attempts", last);
+    }
+
+    // Socket with explicit connect + read timeouts so hung servers don't block forever
+    private static Socket newSocket(String host, int port) throws IOException {
+        Socket s = new Socket();
+        s.connect(new InetSocketAddress(host, port), GfsConfig.SOCKET_CONNECT_TIMEOUT_MS);
+        s.setSoTimeout(GfsConfig.SOCKET_READ_TIMEOUT_MS);
+        return s;
+    }
+
+    private static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     @SuppressWarnings("unchecked")

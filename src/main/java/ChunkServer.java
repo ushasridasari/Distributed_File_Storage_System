@@ -234,19 +234,31 @@ public class ChunkServer {
 
         private void replicateTo(String msgType, String chunkId, byte[] data,
                                  long version, MasterServer.ChunkLocation loc) {
-            try (Socket s   = new Socket(loc.host, loc.port);
-                 ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
-                 ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
-
-                out.writeObject(new Message(msgType)
-                    .put("chunkId", chunkId)
-                    .put("data", data)
-                    .put("version", version));
-                in.readObject();
-                System.out.println("[ChunkServer] Replicated " + chunkId + " -> " + loc);
-            } catch (Exception e) {
-                System.err.println("[ChunkServer] Replication to " + loc + " failed: " + e.getMessage());
+            Exception last = null;
+            for (int attempt = 1; attempt <= GfsConfig.RPC_MAX_RETRIES; attempt++) {
+                try {
+                    Socket s = newSocket(loc.host, loc.port);
+                    try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+                         ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+                        out.writeObject(new Message(msgType)
+                            .put("chunkId", chunkId)
+                            .put("data", data)
+                            .put("version", version));
+                        in.readObject();
+                        System.out.println("[ChunkServer] Replicated " + chunkId + " -> " + loc);
+                        return;
+                    } finally { try { s.close(); } catch (IOException ignored) {} }
+                } catch (Exception e) {
+                    last = e;
+                    if (attempt < GfsConfig.RPC_MAX_RETRIES) {
+                        System.err.printf("[ChunkServer] Replication attempt %d/%d to %s failed (%s), retrying...%n",
+                            attempt, GfsConfig.RPC_MAX_RETRIES, loc, e.getMessage());
+                        sleep(GfsConfig.RPC_RETRY_DELAY_MS * attempt);
+                    }
+                }
             }
+            System.err.printf("[ChunkServer] Replication to %s failed after %d attempts: %s%n",
+                loc, GfsConfig.RPC_MAX_RETRIES, last != null ? last.getMessage() : "unknown");
         }
 
         @SuppressWarnings("unchecked")
@@ -321,22 +333,35 @@ public class ChunkServer {
     }
 
     private void renewLease(String chunkId) {
-        try (Socket s   = new Socket(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT);
-             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
-             ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
-
-            out.writeObject(new Message("RENEW_LEASE")
-                .put("chunkId", chunkId)
-                .put("primary", new MasterServer.ChunkLocation(host, port)));
-            Message resp = (Message) in.readObject();
-            if ("OK".equals(resp.type)) {
-                long newExpiry = ((Number) resp.get("leaseExpiry")).longValue();
-                primaryLeases.put(chunkId, newExpiry);
-            } else {
-                primaryLeases.remove(chunkId); // revoked by master
+        for (int attempt = 1; attempt <= GfsConfig.RPC_MAX_RETRIES; attempt++) {
+            try {
+                Socket s = newSocket(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT);
+                try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+                     ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+                    out.writeObject(new Message("RENEW_LEASE")
+                        .put("chunkId", chunkId)
+                        .put("primary", new MasterServer.ChunkLocation(host, port)));
+                    Message resp = (Message) in.readObject();
+                    if ("OK".equals(resp.type)) {
+                        long newExpiry = ((Number) resp.get("leaseExpiry")).longValue();
+                        primaryLeases.put(chunkId, newExpiry);
+                    } else {
+                        primaryLeases.remove(chunkId); // explicitly revoked by master
+                    }
+                    return;
+                } finally { try { s.close(); } catch (IOException ignored) {} }
+            } catch (Exception e) {
+                if (attempt < GfsConfig.RPC_MAX_RETRIES) {
+                    System.err.printf("[ChunkServer] Lease renewal attempt %d/%d failed for %s (%s), retrying...%n",
+                        attempt, GfsConfig.RPC_MAX_RETRIES, chunkId, e.getMessage());
+                    sleep(GfsConfig.RPC_RETRY_DELAY_MS * attempt);
+                } else {
+                    // Only log — do NOT remove the lease on transient network failure.
+                    // The lease will expire naturally if the Master truly revoked it.
+                    System.err.printf("[ChunkServer] Lease renewal failed for %s after %d attempts: %s%n",
+                        chunkId, GfsConfig.RPC_MAX_RETRIES, e.getMessage());
+                }
             }
-        } catch (Exception e) {
-            System.err.println("[ChunkServer] Lease renewal failed for " + chunkId + ": " + e.getMessage());
         }
     }
 
@@ -356,14 +381,37 @@ public class ChunkServer {
     }
 
     private void sendToMaster(Message msg) {
-        try (Socket s   = new Socket(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT);
-             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
-             ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
-            out.writeObject(msg);
-            in.readObject();
-        } catch (Exception e) {
-            System.err.println("[ChunkServer] Master contact failed: " + e.getMessage());
+        for (int attempt = 1; attempt <= GfsConfig.RPC_MAX_RETRIES; attempt++) {
+            try {
+                Socket s = newSocket(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT);
+                try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+                     ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+                    out.writeObject(msg);
+                    in.readObject();
+                    return;
+                } finally { try { s.close(); } catch (IOException ignored) {} }
+            } catch (Exception e) {
+                if (attempt < GfsConfig.RPC_MAX_RETRIES) {
+                    System.err.printf("[ChunkServer] Master contact attempt %d/%d failed (%s), retrying...%n",
+                        attempt, GfsConfig.RPC_MAX_RETRIES, e.getMessage());
+                    sleep(GfsConfig.RPC_RETRY_DELAY_MS * attempt);
+                } else {
+                    System.err.println("[ChunkServer] Master unreachable after " +
+                        GfsConfig.RPC_MAX_RETRIES + " attempts: " + e.getMessage());
+                }
+            }
         }
+    }
+
+    private static Socket newSocket(String host, int port) throws IOException {
+        Socket s = new Socket();
+        s.connect(new InetSocketAddress(host, port), GfsConfig.SOCKET_CONNECT_TIMEOUT_MS);
+        s.setSoTimeout(GfsConfig.SOCKET_READ_TIMEOUT_MS);
+        return s;
+    }
+
+    private static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     // -------------------------------------------------------------------------
