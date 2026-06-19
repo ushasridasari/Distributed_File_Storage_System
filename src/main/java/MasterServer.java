@@ -1,5 +1,7 @@
 import java.io.*;
 import java.net.*;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.*;
@@ -9,15 +11,18 @@ import java.util.stream.*;
  *
  * Mirrors how GitRepository.java centralises all ref/HEAD logic in the
  * reference DVCS project. All master-side concerns live here:
- *   - File namespace (path -> chunk list)
+ *   - File namespace (path -> chunk list) with directory support
  *   - Chunk server registry (heartbeat tracking + placement)
  *   - Request handler (one connection = one thread)
+ *   - Operation log for crash recovery (like Git's reflog)
+ *   - Background re-replication when servers go offline
  *
  * GFS paper responsibilities:
  *   - Maintain file namespace and chunk-to-location mapping
  *   - Grant chunk leases (primary election for writes)
  *   - Direct chunk placement based on server load
  *   - Process heartbeats to detect dead servers
+ *   - Re-replicate chunks that fall below replication factor
  */
 public class MasterServer {
 
@@ -29,11 +34,19 @@ public class MasterServer {
         String path;
         List<String> chunkIds = new ArrayList<>();
         long createdAt = System.currentTimeMillis();
+        long updatedAt = createdAt;
         long fileSize;
+        boolean isDirectory;
 
-        FileMetadata(String path) { this.path = path; }
+        FileMetadata(String path, boolean isDirectory) {
+            this.path = path;
+            this.isDirectory = isDirectory;
+        }
 
-        void addChunk(String chunkId) { chunkIds.add(chunkId); }
+        void addChunk(String chunkId) {
+            chunkIds.add(chunkId);
+            updatedAt = System.currentTimeMillis();
+        }
     }
 
     static class ChunkMetadata implements Serializable {
@@ -58,6 +71,14 @@ public class MasterServer {
         }
 
         @Override public String toString() { return host + ":" + port; }
+
+        @Override public boolean equals(Object o) {
+            if (!(o instanceof ChunkLocation)) return false;
+            ChunkLocation c = (ChunkLocation) o;
+            return port == c.port && host.equals(c.host);
+        }
+
+        @Override public int hashCode() { return Objects.hash(host, port); }
     }
 
     static class ServerInfo {
@@ -66,6 +87,40 @@ public class MasterServer {
         Set<String> chunks = ConcurrentHashMap.newKeySet();
 
         ServerInfo(ChunkLocation loc) { this.location = loc; }
+
+        boolean isAlive() {
+            return (System.currentTimeMillis() - lastHeartbeat) < GfsConfig.CHUNK_SERVER_TIMEOUT_MS;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Operation log — mirrors Git's reflog for crash recovery
+    // -------------------------------------------------------------------------
+
+    static class OperationLog {
+        private final Path logFile;
+
+        OperationLog(String logPath) throws IOException {
+            this.logFile = Paths.get(logPath);
+            Files.createDirectories(logFile.getParent());
+        }
+
+        void append(String operation, String details) {
+            try {
+                String entry = String.format("[%s] %s %s%n",
+                    new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()),
+                    operation, details);
+                Files.writeString(logFile, entry,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                System.err.println("[Master] Failed to write operation log: " + e.getMessage());
+            }
+        }
+
+        List<String> readAll() throws IOException {
+            if (!Files.exists(logFile)) return new ArrayList<>();
+            return Files.readAllLines(logFile);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -76,7 +131,9 @@ public class MasterServer {
     private final Map<String, FileMetadata>  namespace  = new ConcurrentHashMap<>();
     private final Map<String, ChunkMetadata> chunkTable = new ConcurrentHashMap<>();
     private final Map<String, ServerInfo>    servers    = new ConcurrentHashMap<>();
-    private final ExecutorService pool = Executors.newCachedThreadPool();
+    private final ExecutorService pool      = Executors.newCachedThreadPool();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private OperationLog opLog;
     private volatile boolean running;
 
     public MasterServer(int port) { this.port = port; }
@@ -87,6 +144,8 @@ public class MasterServer {
 
     public void start() throws IOException {
         running = true;
+        opLog = new OperationLog(".gfs/master.log");
+        scheduleReReplication();
         System.out.println("[Master] Listening on port " + port);
         try (ServerSocket ss = new ServerSocket(port)) {
             while (running) {
@@ -96,7 +155,74 @@ public class MasterServer {
         }
     }
 
-    public void stop() { running = false; pool.shutdown(); }
+    public void stop() {
+        running = false;
+        pool.shutdown();
+        scheduler.shutdown();
+    }
+
+    // -------------------------------------------------------------------------
+    // Background re-replication (GFS §4.4)
+    // Detects under-replicated chunks after server failures and re-replicates
+    // -------------------------------------------------------------------------
+
+    private void scheduleReReplication() {
+        scheduler.scheduleAtFixedRate(() -> {
+            for (Map.Entry<String, ChunkMetadata> entry : chunkTable.entrySet()) {
+                ChunkMetadata cm = entry.getValue();
+                long liveReplicas = cm.locations.stream()
+                    .filter(loc -> {
+                        ServerInfo si = servers.get(loc.toString());
+                        return si != null && si.isAlive();
+                    }).count();
+
+                if (liveReplicas < GfsConfig.REPLICATION_FACTOR && liveReplicas > 0) {
+                    triggerReReplication(cm, (int) liveReplicas);
+                }
+            }
+        }, 10000, 10000, TimeUnit.MILLISECONDS);
+    }
+
+    private void triggerReReplication(ChunkMetadata cm, int currentReplicas) {
+        int needed = GfsConfig.REPLICATION_FACTOR - currentReplicas;
+        List<ChunkLocation> liveLocations = cm.locations.stream()
+            .filter(loc -> { ServerInfo si = servers.get(loc.toString()); return si != null && si.isAlive(); })
+            .collect(Collectors.toList());
+
+        if (liveLocations.isEmpty()) return;
+
+        List<ChunkLocation> newTargets = liveServers().stream()
+            .map(s -> s.location)
+            .filter(loc -> !cm.locations.contains(loc))
+            .limit(needed)
+            .collect(Collectors.toList());
+
+        ChunkLocation source = liveLocations.get(0);
+        for (ChunkLocation target : newTargets) {
+            try (Socket s = new Socket(source.host, source.port);
+                 ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+                 ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
+
+                out.writeObject(new Message("READ_CHUNK").put("chunkId", cm.chunkId));
+                Message resp = (Message) in.readObject();
+                if ("OK".equals(resp.type)) {
+                    byte[] data = (byte[]) resp.get("data");
+                    try (Socket t   = new Socket(target.host, target.port);
+                         ObjectOutputStream tout = new ObjectOutputStream(t.getOutputStream());
+                         ObjectInputStream  tin  = new ObjectInputStream(t.getInputStream())) {
+                        tout.writeObject(new Message("REPLICATE_CHUNK")
+                            .put("chunkId", cm.chunkId).put("data", data));
+                        tin.readObject();
+                        cm.locations.add(target);
+                        System.out.printf("[Master] Re-replicated chunk %s to %s%n", cm.chunkId, target);
+                        opLog.append("RE_REPLICATE", cm.chunkId + " -> " + target);
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("[Master] Re-replication failed: " + e.getMessage());
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Request dispatch
@@ -121,12 +247,17 @@ public class MasterServer {
         switch (req.type) {
             case "CREATE_FILE":           return createFile(req);
             case "DELETE_FILE":           return deleteFile(req);
+            case "RENAME_FILE":           return renameFile(req);
+            case "MKDIR":                 return mkdir(req);
             case "LIST_FILES":            return listFiles(req);
             case "GET_FILE_INFO":         return getFileInfo(req);
+            case "STAT":                  return stat(req);
             case "REQUEST_CHUNK_WRITE":   return requestChunkWrite(req);
+            case "REQUEST_CHUNK_APPEND":  return requestChunkAppend(req);
             case "REQUEST_CHUNK_READ":    return requestChunkRead(req);
             case "REGISTER_CHUNK_SERVER": return registerServer(req);
             case "HEARTBEAT":             return heartbeat(req);
+            case "CLUSTER_STATUS":        return clusterStatus(req);
             default:
                 return Message.error("Unknown command: " + req.type);
         }
@@ -140,7 +271,8 @@ public class MasterServer {
         String path = (String) req.get("path");
         if (namespace.containsKey(path))
             return Message.error("File already exists: " + path);
-        namespace.put(path, new FileMetadata(path));
+        namespace.put(path, new FileMetadata(path, false));
+        opLog.append("CREATE", path);
         return Message.ok().put("path", path);
     }
 
@@ -149,6 +281,28 @@ public class MasterServer {
         FileMetadata meta = namespace.remove(path);
         if (meta == null) return Message.error("File not found: " + path);
         meta.chunkIds.forEach(chunkTable::remove); // lazy GC
+        opLog.append("DELETE", path);
+        return Message.ok();
+    }
+
+    private Message renameFile(Message req) {
+        String src = (String) req.get("src");
+        String dst = (String) req.get("dst");
+        if (!namespace.containsKey(src)) return Message.error("File not found: " + src);
+        if (namespace.containsKey(dst))  return Message.error("Destination already exists: " + dst);
+        FileMetadata meta = namespace.remove(src);
+        meta.path = dst;
+        meta.updatedAt = System.currentTimeMillis();
+        namespace.put(dst, meta);
+        opLog.append("RENAME", src + " -> " + dst);
+        return Message.ok();
+    }
+
+    private Message mkdir(Message req) {
+        String path = (String) req.get("path");
+        if (namespace.containsKey(path)) return Message.error("Path already exists: " + path);
+        namespace.put(path, new FileMetadata(path, true));
+        opLog.append("MKDIR", path);
         return Message.ok();
     }
 
@@ -169,14 +323,59 @@ public class MasterServer {
             .put("path", meta.path)
             .put("chunkIds", meta.chunkIds)
             .put("fileSize", meta.fileSize)
-            .put("createdAt", meta.createdAt);
+            .put("createdAt", meta.createdAt)
+            .put("updatedAt", meta.updatedAt)
+            .put("isDirectory", meta.isDirectory);
+    }
+
+    private Message stat(Message req) {
+        String path = (String) req.get("path");
+        FileMetadata meta = namespace.get(path);
+        if (meta == null) return Message.error("No such file or directory: " + path);
+
+        int totalReplicas = meta.chunkIds.stream()
+            .mapToInt(id -> chunkTable.containsKey(id) ? chunkTable.get(id).locations.size() : 0)
+            .sum();
+
+        return new Message("STAT")
+            .put("path", meta.path)
+            .put("isDirectory", meta.isDirectory)
+            .put("fileSize", meta.fileSize)
+            .put("chunkCount", meta.chunkIds.size())
+            .put("totalReplicas", totalReplicas)
+            .put("createdAt", meta.createdAt)
+            .put("updatedAt", meta.updatedAt);
     }
 
     private Message requestChunkWrite(Message req) {
         String path = (String) req.get("path");
         FileMetadata meta = namespace.get(path);
         if (meta == null) return Message.error("File not found: " + path);
+        return allocateChunk(meta);
+    }
 
+    // Atomic record append — GFS §3.3: master picks the last chunk's primary
+    private Message requestChunkAppend(Message req) {
+        String path = (String) req.get("path");
+        FileMetadata meta = namespace.get(path);
+        if (meta == null) return Message.error("File not found: " + path);
+
+        // reuse last chunk if it exists, otherwise allocate a new one
+        if (!meta.chunkIds.isEmpty()) {
+            String lastChunkId = meta.chunkIds.get(meta.chunkIds.size() - 1);
+            ChunkMetadata cm = chunkTable.get(lastChunkId);
+            if (cm != null && !cm.locations.isEmpty()) {
+                return new Message("CHUNK_INFO")
+                    .put("chunkId", cm.chunkId)
+                    .put("primary", cm.primary)
+                    .put("secondaries", cm.locations.subList(1, cm.locations.size()))
+                    .put("append", true);
+            }
+        }
+        return allocateChunk(meta);
+    }
+
+    private Message allocateChunk(FileMetadata meta) {
         List<ChunkLocation> candidates = selectServers(
             Math.min(GfsConfig.REPLICATION_FACTOR, liveServers().size()));
         if (candidates.isEmpty()) return Message.error("No chunk servers available");
@@ -187,6 +386,7 @@ public class MasterServer {
         cm.primary = candidates.get(0);
         chunkTable.put(chunkId, cm);
         meta.addChunk(chunkId);
+        opLog.append("ALLOC_CHUNK", chunkId + " for " + meta.path);
 
         return new Message("CHUNK_INFO")
             .put("chunkId", chunkId)
@@ -212,6 +412,7 @@ public class MasterServer {
         info.chunks.addAll(chunks);
         servers.put(key, info);
         System.out.println("[Master] Registered chunk server " + key);
+        opLog.append("REGISTER_SERVER", key);
         return Message.ok();
     }
 
@@ -228,14 +429,33 @@ public class MasterServer {
         return Message.ok();
     }
 
+    private Message clusterStatus(Message req) {
+        List<ServerInfo> live = liveServers();
+        List<ServerInfo> dead = servers.values().stream()
+            .filter(s -> !s.isAlive()).collect(Collectors.toList());
+
+        int totalChunks = chunkTable.size();
+        int totalFiles  = (int) namespace.values().stream().filter(m -> !m.isDirectory).count();
+        int totalDirs   = (int) namespace.values().stream().filter(m ->  m.isDirectory).count();
+
+        List<String> liveList = live.stream().map(s -> s.location.toString()).collect(Collectors.toList());
+        List<String> deadList = dead.stream().map(s -> s.location.toString()).collect(Collectors.toList());
+
+        return new Message("CLUSTER_STATUS")
+            .put("liveServers",  liveList)
+            .put("deadServers",  deadList)
+            .put("totalChunks",  totalChunks)
+            .put("totalFiles",   totalFiles)
+            .put("totalDirs",    totalDirs);
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
     private List<ServerInfo> liveServers() {
-        long now = System.currentTimeMillis();
         return servers.values().stream()
-            .filter(s -> (now - s.lastHeartbeat) < GfsConfig.CHUNK_SERVER_TIMEOUT_MS)
+            .filter(ServerInfo::isAlive)
             .collect(Collectors.toList());
     }
 
