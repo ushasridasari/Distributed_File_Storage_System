@@ -51,14 +51,55 @@ public class ChunkStorageTest {
     }
 
     @Test
-    public void testListChunks() throws IOException {
+    public void testListChunksExcludesCrcFiles() throws IOException {
         storage.write("c1", "a".getBytes());
         storage.write("c2", "b".getBytes());
-        assertEquals(2, storage.list().size());
+        assertEquals(2, storage.list().size()); // .crc sidecars must not be counted
     }
 
     @Test(expected = java.io.FileNotFoundException.class)
     public void testReadMissingChunkThrows() throws IOException {
         storage.read("nonexistent");
+    }
+
+    @Test
+    public void testAppendToExistingChunk() throws IOException {
+        storage.write("append-chunk", "hello".getBytes());
+        storage.append("append-chunk", " world".getBytes());
+        assertEquals("hello world", new String(storage.read("append-chunk")));
+    }
+
+    @Test
+    public void testAppendToNewChunk() throws IOException {
+        storage.append("new-chunk", "first".getBytes());
+        storage.append("new-chunk", " second".getBytes());
+        assertEquals("first second", new String(storage.read("new-chunk")));
+    }
+
+    @Test
+    public void testCrcSidecarCreatedOnWrite() throws IOException {
+        storage.write("sidecar-chunk", "data".getBytes());
+        assertTrue(Files.exists(tempDir.resolve("sidecar-chunk.crc")));
+    }
+
+    @Test
+    public void testCrcVerificationPassesOnValidData() throws IOException {
+        storage.write("crc-chunk", "valid data".getBytes());
+        assertArrayEquals("valid data".getBytes(), storage.read("crc-chunk"));
+    }
+
+    @Test
+    public void testChunkSize() throws IOException {
+        byte[] data = new byte[1024];
+        storage.write("sized-chunk", data);
+        assertEquals(1024, storage.size("sized-chunk"));
+    }
+
+    @Test
+    public void testDeleteRemovesCrcSidecar() throws IOException {
+        storage.write("to-delete", "data".getBytes());
+        storage.delete("to-delete");
+        assertFalse(Files.exists(tempDir.resolve("to-delete")));
+        assertFalse(Files.exists(tempDir.resolve("to-delete.crc")));
     }
 }
