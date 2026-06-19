@@ -85,6 +85,7 @@ src/
 | **Socket timeouts** | §4 | All TCP sockets have explicit connect (5 s) and read (30 s) deadlines so a hung server never blocks the caller indefinitely |
 | **RPC retry with backoff** | §4 | Master RPCs, chunk writes, replication, and lease renewals retry up to 3 times with linear backoff (500 ms × attempt) before failing |
 | **Safe lease renewal** | §5.4 | Transient network errors during lease renewal no longer revoke the lease — only an explicit master rejection does |
+| **Node rejoin reconciliation** | §4.4, §4.5 | On every heartbeat the Master reconciles reported chunks: valid replicas (version matches) are re-admitted to the replica list immediately; orphaned chunks (file deleted while node was offline) are garbage-collected via `DELETE_CHUNK` |
 
 ## Quick Start
 

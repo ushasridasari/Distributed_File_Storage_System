@@ -613,12 +613,13 @@ public class MasterServer {
         if (req.has("freeBytes")) info.freeBytes = ((Number) req.get("freeBytes")).longValue();
         if (req.has("rackId"))    info.rackId    = (String) req.get("rackId");
 
-        // Update reported versions and evict stale replicas
+        // Update reported versions, evict stale replicas, and reconcile rejoining nodes
         if (req.has("chunkVersions")) {
             Map<String, Long> reported = (Map<String, Long>) req.get("chunkVersions");
             info.chunkVersions.clear();
             info.chunkVersions.putAll(reported);
             evictStaleReplicas(info, reported);
+            reconcileRejoin(info, reported);
         }
         return Message.ok();
     }
@@ -638,7 +639,7 @@ public class MasterServer {
      */
     private void evictStaleReplicas(ServerInfo server, Map<String, Long> reportedVersions) {
         for (Map.Entry<String, Long> entry : reportedVersions.entrySet()) {
-            String chunkId        = entry.getKey();
+            String chunkId         = entry.getKey();
             long   reportedVersion = entry.getValue();
             ChunkMetadata cm = chunkTable.get(chunkId);
             if (cm == null) continue;
@@ -648,9 +649,46 @@ public class MasterServer {
                     System.out.printf("[Master] Evicted stale replica of chunk %s from %s " +
                         "(reported v%d, expected v%d)%n",
                         chunkId, server.location, reportedVersion, cm.version);
-                    // Also revoke lease if this server was primary
                     if (server.location.equals(cm.primary)) cm.revokeLease();
                 }
+            }
+        }
+    }
+
+    /**
+     * Node rejoin reconciliation (GFS §4.4, §4.5):
+     *
+     * When a server comes back after being offline it reports all the chunks
+     * it still holds.  We do two things:
+     *
+     *   1. Re-admit valid replicas — if the reported version matches the
+     *      master's expected version and the server is not already in the
+     *      replica list, add it back.  This restores replication factor
+     *      without waiting for the background re-replication job.
+     *
+     *   2. Delete orphaned chunks — if the server holds a chunk that is no
+     *      longer in the chunkTable (the file was deleted while the node was
+     *      offline), send DELETE_CHUNK so the disk space is reclaimed.
+     */
+    private void reconcileRejoin(ServerInfo server, Map<String, Long> reportedVersions) {
+        for (Map.Entry<String, Long> entry : reportedVersions.entrySet()) {
+            String chunkId         = entry.getKey();
+            long   reportedVersion = entry.getValue();
+            ChunkMetadata cm = chunkTable.get(chunkId);
+
+            if (cm == null) {
+                // Orphaned chunk — file was deleted while this server was offline
+                System.out.printf("[Master] Deleting orphaned chunk %s from rejoining server %s%n",
+                    chunkId, server.location);
+                deleteChunkFromServer(chunkId, server.location);
+                continue;
+            }
+
+            // Re-admit if version is current and not already tracked
+            if (reportedVersion == cm.version && !cm.locations.contains(server.location)) {
+                cm.locations.add(server.location);
+                System.out.printf("[Master] Re-admitted chunk %s at %s (v%d) after rejoin%n",
+                    chunkId, server.location, reportedVersion);
             }
         }
     }
