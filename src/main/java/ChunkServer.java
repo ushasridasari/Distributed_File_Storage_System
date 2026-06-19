@@ -293,11 +293,14 @@ public class ChunkServer {
 
     public void start() throws IOException {
         running = true;
-        registerWithMaster();
-        scheduleHeartbeats();
-        scheduleLeaseRenewals();
-        System.out.println("[ChunkServer] Listening on " + host + ":" + port);
+        // Bind the ServerSocket BEFORE registering with Master so the Master
+        // never assigns this server as a write target before it can accept connections.
         try (ServerSocket ss = new ServerSocket(port)) {
+            ss.setReuseAddress(true);
+            registerWithMaster();
+            scheduleHeartbeats();
+            scheduleLeaseRenewals();
+            System.out.println("[ChunkServer] Listening on " + host + ":" + port);
             while (running) {
                 Socket client = ss.accept();
                 pool.submit(new Handler(client, storage));
