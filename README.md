@@ -80,6 +80,8 @@ src/
 | **Lazy chunk GC** (directories/rename) | §4.4 | Renamed/deleted file entries cleaned from namespace; chunk GC runs immediately |
 | **Streaming large-file upload** | §2.6 | `GfsClient.upload` reads one 64 MB buffer at a time; heap usage is O(1) regardless of file size |
 | **Accurate file size tracking** | §2.6 | Master updates `FileMetadata.fileSize` via `UPDATE_FILE_SIZE` RPC after upload; `stat` reports the correct size |
+| **Disk-space-aware placement** | §3.1 | ChunkServers report free disk bytes in every heartbeat; Master sorts candidates by free space descending before selecting replica targets |
+| **Rack-aware placement** | §3.1 | Each ChunkServer declares a rack ID on startup; Master spreads the 3 replicas across distinct racks first, falling back to any live server when racks are fewer than replication factor |
 
 ## Quick Start
 
@@ -104,9 +106,10 @@ java -cp $JAR Main master
 
 **2. Start chunk servers (3 for full replication):**
 ```bash
-java -cp $JAR Main chunkserver 9100 chunk_data/node1
-java -cp $JAR Main chunkserver 9101 chunk_data/node2
-java -cp $JAR Main chunkserver 9102 chunk_data/node3
+# Assign different rack IDs so replicas spread across racks (GFS §3.1)
+java -cp $JAR Main chunkserver 9100 chunk_data/node1 rack-A
+java -cp $JAR Main chunkserver 9101 chunk_data/node2 rack-B
+java -cp $JAR Main chunkserver 9102 chunk_data/node3 rack-C
 ```
 
 **3. Use the CLI:**
@@ -171,7 +174,7 @@ mvn test
 | Command | Usage | Description |
 |---------|-------|-------------|
 | `master` | `master [port]` | Start the Master server (default port: 9000) |
-| `chunkserver` | `chunkserver <port> [storage-dir]` | Start a Chunk server (default port: 9100) |
+| `chunkserver` | `chunkserver <port> [storage-dir] [rack-id]` | Start a Chunk server; rack-id groups servers for rack-aware placement (default: `default-rack`) |
 
 ## Configuration
 
