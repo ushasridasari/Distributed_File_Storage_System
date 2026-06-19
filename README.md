@@ -5,16 +5,16 @@ A distributed file storage system inspired by the [Google File System paper (Ghe
 ## Architecture
 
 ```
-┌──────────────────┐          ┌────────────────────────────────────┐
-│    GfsClient     │─── RPC ──│           MasterServer             │
-│  (Main.java CLI) │          │  namespace + chunk registry +      │
-└────────┬─────────┘          │  operation log + re-replication    │
-         │ direct             └────────────────────────────────────┘
-         │ chunk I/O                    ▲  heartbeat (every 5s)
-         ▼                              │
+┌──────────────────┐          ┌────────────────────────────────────────┐
+│    GfsClient     │─── RPC ──│             MasterServer               │
+│  (Main.java CLI) │          │  namespace + chunk registry +          │
+└────────┬─────────┘          │  operation log + checkpoint +          │
+         │ direct             │  lease management + re-replication     │
+         │ chunk I/O          └────────────────────────────────────────┘
+         ▼                              ▲  heartbeat (versions, every 5s)
 ┌─────────────────────────────────────────────────────┐
 │  ChunkServer :9100  │  ChunkServer :9101  │  :9102  │
-│  (data + CRC32)     │  (data + CRC32)     │  ...    │
+│  data + .crc + .ver │  data + .crc + .ver │  ...    │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -24,44 +24,60 @@ A distributed file storage system inspired by the [Google File System paper (Ghe
 src/
 ├── main/java/
 │   ├── Main.java          — CLI entry point (11 commands)
-│   ├── MasterServer.java  — metadata coordinator (namespace, chunk registry,
-│   │                        operation log, background re-replication)
-│   ├── ChunkServer.java   — chunk storage (flat files + CRC32 checksums,
-│   │                        read/write/append/verify, replication chaining)
-│   ├── GfsClient.java     — high-level client API with chunk location cache
+│   ├── MasterServer.java  — metadata coordinator:
+│   │                          namespace, chunk registry, chunk versions,
+│   │                          stale replica eviction, actual chunk GC,
+│   │                          lease grant/expiry/renewal, operation log,
+│   │                          checkpoint + log replay, re-replication
+│   ├── ChunkServer.java   — chunk storage:
+│   │                          flat files + .crc (CRC32) + .ver (version) sidecars,
+│   │                          read/write/append/verify, replication chaining,
+│   │                          heartbeat with version map, lease renewal scheduler
+│   ├── GfsClient.java     — high-level client API:
+│   │                          upload, download, append, delete, rename, mkdir,
+│   │                          list, stat, clusterStatus, chunk location cache,
+│   │                          replica fallback on read
 │   ├── GfsConfig.java     — cluster constants + .gfs/config reader/writer
 │   └── Message.java       — TCP wire message (type + key-value payload)
 └── test/java/
-    ├── MasterServerTest.java   — namespace, rename, mkdir, liveness tests
-    └── ChunkStorageTest.java   — write, read, append, CRC, delete tests
+    ├── MasterServerTest.java   — namespace, rename, mkdir, versioning,
+    │                             stale eviction, lease, chunk GC tests
+    └── ChunkStorageTest.java   — write, read, append, CRC, version sidecar,
+                                  delete, list tests
 ```
 
 ## Components
 
 | File | Responsibility |
 |------|----------------|
-| **MasterServer.java** | Single metadata coordinator. Holds the file namespace and chunk-to-location map as inner classes (`FileMetadata`, `ChunkMetadata`, `ChunkLocation`, `ServerInfo`). Handles all client and chunk-server RPCs, writes an operation log for crash recovery, and runs a background thread to re-replicate under-replicated chunks. |
-| **ChunkServer.java** | Stores chunk data as flat files on local disk. Inner class `ChunkStorage` writes a `.crc` sidecar alongside every chunk and verifies it on every read. Inner class `Handler` serves read/write/append/verify requests and chains replication to secondaries. Sends periodic heartbeats to the Master. |
-| **GfsClient.java** | High-level API for all file operations. Maintains a 60-second client-side chunk location cache to avoid hitting the Master on every read. |
-| **GfsConfig.java** | All cluster-wide constants. Also reads/writes a `.gfs/config` INI file (same pattern as `Config.java` in the reference DVCS project). |
+| **MasterServer.java** | Single metadata coordinator. Holds the file namespace and chunk-to-location map as inner classes (`FileMetadata`, `ChunkMetadata`, `ChunkLocation`, `ServerInfo`, `OperationLog`, `Checkpoint`). Handles all RPCs, writes an operation log, takes periodic checkpoints, evicts stale chunk replicas via version numbers, sends actual `DELETE_CHUNK` RPCs on file delete, manages lease grants/expiry/renewal, and re-replicates under-replicated chunks in the background. |
+| **ChunkServer.java** | Stores chunk data as flat files. Writes `.crc` (CRC32) and `.ver` (version number) sidecar files alongside every chunk. Verifies CRC on every read. Reports a `chunkId → version` map in heartbeats so the Master can detect stale replicas. Schedules lease renewal requests before the 60 s window expires. |
+| **GfsClient.java** | High-level API for all file operations. Passes the chunk version received from the lease into every write so ChunkServers store the correct version. Falls back across replica list on read errors. Maintains a 60-second client-side chunk location cache. |
+| **GfsConfig.java** | All cluster-wide constants including `LEASE_DURATION_MS` and `CHECKPOINT_INTERVAL_MS`. Reads/writes a `.gfs/config` INI file. |
 | **Message.java** | Lightweight serialisable wire message: a string `type` plus a `HashMap` payload. |
-| **Main.java** | Single CLI entry point dispatching all 11 commands (same pattern as `Main.java` in the reference DVCS project). |
+| **Main.java** | Single CLI entry point dispatching all 11 commands. |
 
 ## GFS Design Decisions Implemented
 
-| Decision | Detail |
-|----------|--------|
-| **64 MB chunk size** | `GfsConfig.CHUNK_SIZE_BYTES` — same default as the GFS paper |
-| **3× replication** | `GfsConfig.REPLICATION_FACTOR` — each chunk written to 3 servers |
-| **Primary-chain replication** | Client writes to the primary; primary chains to secondaries |
-| **Lease-based primary election** | Master picks the first server as primary when granting a write lease |
-| **Atomic record append** | `append` command targets the last chunk's primary (GFS §3.3) |
-| **Heartbeat-driven registry** | Chunk server locations rebuilt from heartbeats every 5 s |
-| **Background re-replication** | Master checks chunk replica counts every 10 s and fixes under-replicated chunks |
-| **Operation log** | Every mutation (create, delete, rename, mkdir, chunk alloc) appended to `.gfs/master.log` |
-| **CRC32 checksums** | `.crc` sidecar stored beside every chunk; verified on every read to detect silent corruption |
-| **Client-side location cache** | Chunk locations cached for 60 s (`GfsConfig.CACHE_TTL_MS`) to reduce Master load |
-| **Lazy chunk GC** | Deleted file's chunk metadata removed from Master; chunk servers clean up on next heartbeat cycle |
+| Decision | GFS Paper § | Detail |
+|----------|-------------|--------|
+| **64 MB chunk size** | §2.6 | `GfsConfig.CHUNK_SIZE_BYTES` |
+| **3× replication** | §2.6 | `GfsConfig.REPLICATION_FACTOR` — each chunk on 3 servers |
+| **Primary-chain replication** | §3.1 | Client → primary → secondaries |
+| **Lease-based primary election** | §5.4 | 60 s lease (`LEASE_DURATION_MS`); ChunkServer renews 10 s before expiry |
+| **Lease expiry + renewal** | §5.4 | `RENEW_LEASE` RPC; Master revokes expired leases and re-elects primary |
+| **Atomic record append** | §3.3 | `append` targets the last chunk's primary; new chunk allocated if needed |
+| **Chunk version numbers** | §4.5 | Version incremented on each write; `.ver` sidecar on disk |
+| **Stale replica eviction** | §4.5 | Heartbeat carries `chunkId → version` map; Master removes replicas with old versions |
+| **Actual chunk GC** | §4.4 | `DELETE_FILE` sends `DELETE_CHUNK` RPC to every replica, freeing disk space |
+| **Heartbeat-driven registry** | §4.4 | Chunk server locations rebuilt from heartbeats every 5 s |
+| **Background re-replication** | §4.4 | Master checks replica counts every 10 s and copies chunks to new servers |
+| **Operation log** | §5.2 | Every mutation appended to `.gfs/master.log` before being applied |
+| **Namespace checkpoint** | §5.2 | Namespace + chunkTable serialised to `.gfs/checkpoint.ser` every 5 min; log truncated after; loaded on startup with log replay |
+| **CRC32 checksums** | §5.2 | `.crc` sidecar per chunk; verified on every read to catch silent corruption |
+| **Client-side location cache** | §3.1 | Chunk locations cached for 60 s (`CACHE_TTL_MS`) to reduce Master load |
+| **Replica fallback on read** | §3.1 | Client tries next replica if one fails; evicts stale cache entry |
+| **Lazy chunk GC** (directories/rename) | §4.4 | Renamed/deleted file entries cleaned from namespace; chunk GC runs immediately |
 
 ## Quick Start
 
@@ -99,14 +115,14 @@ java -cp $JAR Main mkdir /data
 # Upload a file
 java -cp $JAR Main upload myfile.txt /data/myfile.txt
 
-# List files
-java -cp $JAR Main list /
-
 # Show file metadata
 java -cp $JAR Main stat /data/myfile.txt
 
 # Atomically append text to a file
 java -cp $JAR Main append /data/myfile.txt "new line of data"
+
+# List files
+java -cp $JAR Main list /
 
 # Rename a file
 java -cp $JAR Main rename /data/myfile.txt /data/renamed.txt
@@ -117,7 +133,7 @@ java -cp $JAR Main download /data/renamed.txt local_copy.txt
 # Check cluster health
 java -cp $JAR Main cluster-status
 
-# Delete a file
+# Delete a file (chunks are GC'd immediately from all servers)
 java -cp $JAR Main delete /data/renamed.txt
 ```
 
@@ -134,9 +150,9 @@ mvn test
 | Command | Usage | Description |
 |---------|-------|-------------|
 | `upload` | `upload <local-path> <gfs-path>` | Split local file into 64 MB chunks and upload to GFS |
-| `download` | `download <gfs-path> <local-path>` | Reassemble chunks from any live replica and write locally |
+| `download` | `download <gfs-path> <local-path>` | Reassemble chunks from any live replica; falls back across replicas |
 | `append` | `append <gfs-path> <text>` | Atomically append text to an existing GFS file (GFS §3.3) |
-| `delete` | `delete <gfs-path>` | Remove file from namespace and schedule chunk GC |
+| `delete` | `delete <gfs-path>` | Remove file and immediately GC chunks from all servers |
 | `rename` | `rename <src-path> <dst-path>` | Rename or move a file within the namespace |
 | `mkdir` | `mkdir <gfs-path>` | Create a directory entry in the namespace |
 | `list` | `list [prefix]` | List all files/directories under a path prefix |
@@ -157,7 +173,7 @@ mvn test
 
 ## Configuration
 
-All defaults live in `GfsConfig.java` and are also written to `.gfs/config` on first run:
+All defaults live in `GfsConfig.java` and are written to `.gfs/config` on first run:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
@@ -167,9 +183,11 @@ All defaults live in `GfsConfig.java` and are also written to `.gfs/config` on f
 | `CHUNK_SERVER_BASE_PORT` | 9100 | Default first chunk server port |
 | `HEARTBEAT_INTERVAL_MS` | 5000 | How often chunk servers ping the Master |
 | `CHUNK_SERVER_TIMEOUT_MS` | 15000 | Time before a chunk server is declared dead |
+| `LEASE_DURATION_MS` | 60000 | How long a write lease is valid (GFS §5.4) |
 | `CACHE_TTL_MS` | 60000 | Client-side chunk location cache lifetime |
+| `CHECKPOINT_INTERVAL_MS` | 300000 | How often the Master checkpoints namespace to disk |
 
-## System properties
+## System Properties
 
 ```bash
 -Dgfs.master.host=<host>   # override Master host (default: localhost)
