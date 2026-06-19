@@ -52,7 +52,7 @@ src/
 |------|----------------|
 | **MasterServer.java** | Single metadata coordinator. Holds the file namespace and chunk-to-location map as inner classes (`FileMetadata`, `ChunkMetadata`, `ChunkLocation`, `ServerInfo`, `OperationLog`, `Checkpoint`). Handles all RPCs, writes an operation log, takes periodic checkpoints, evicts stale chunk replicas via version numbers, sends actual `DELETE_CHUNK` RPCs on file delete, manages lease grants/expiry/renewal, and re-replicates under-replicated chunks in the background. |
 | **ChunkServer.java** | Stores chunk data as flat files. Writes `.crc` (CRC32) and `.ver` (version number) sidecar files alongside every chunk. Verifies CRC on every read. Reports a `chunkId → version` map in heartbeats so the Master can detect stale replicas. Schedules lease renewal requests before the 60 s window expires. |
-| **GfsClient.java** | High-level API for all file operations. Passes the chunk version received from the lease into every write so ChunkServers store the correct version. Falls back across replica list on read errors. Maintains a 60-second client-side chunk location cache. |
+| **GfsClient.java** | High-level API for all file operations. Streams files to GFS one 64 MB chunk at a time (constant heap regardless of file size). Reports the total byte count to the Master after upload so `stat` returns the correct file size. Passes the chunk version received from the lease into every write so ChunkServers store the correct version. Falls back across replica list on read errors. Maintains a 60-second client-side chunk location cache. |
 | **GfsConfig.java** | All cluster-wide constants including `LEASE_DURATION_MS` and `CHECKPOINT_INTERVAL_MS`. Reads/writes a `.gfs/config` INI file. |
 | **Message.java** | Lightweight serialisable wire message: a string `type` plus a `HashMap` payload. |
 | **Main.java** | Single CLI entry point dispatching all 11 commands. |
@@ -78,6 +78,8 @@ src/
 | **Client-side location cache** | §3.1 | Chunk locations cached for 60 s (`CACHE_TTL_MS`) to reduce Master load |
 | **Replica fallback on read** | §3.1 | Client tries next replica if one fails; evicts stale cache entry |
 | **Lazy chunk GC** (directories/rename) | §4.4 | Renamed/deleted file entries cleaned from namespace; chunk GC runs immediately |
+| **Streaming large-file upload** | §2.6 | `GfsClient.upload` reads one 64 MB buffer at a time; heap usage is O(1) regardless of file size |
+| **Accurate file size tracking** | §2.6 | Master updates `FileMetadata.fileSize` via `UPDATE_FILE_SIZE` RPC after upload; `stat` reports the correct size |
 
 ## Quick Start
 
