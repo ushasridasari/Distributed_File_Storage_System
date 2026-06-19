@@ -101,6 +101,10 @@ public class ChunkServer {
             return listWithVersions().keySet();
         }
 
+        long freeBytes() {
+            return dir.toFile().getFreeSpace();
+        }
+
         // ---- sidecar helpers ----
 
         private long computeCrc(byte[] data) {
@@ -259,6 +263,7 @@ public class ChunkServer {
 
     private final String host;
     private final int port;
+    private final String rackId;      // rack this server belongs to (for rack-aware placement)
     private final ChunkStorage storage;
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
@@ -267,9 +272,10 @@ public class ChunkServer {
     // Tracks chunks this server is primary for, with lease expiry time
     private final Map<String, Long> primaryLeases = new ConcurrentHashMap<>();
 
-    public ChunkServer(String host, int port, String storageDir) throws IOException {
+    public ChunkServer(String host, int port, String storageDir, String rackId) throws IOException {
         this.host    = host;
         this.port    = port;
+        this.rackId  = rackId;
         this.storage = new ChunkStorage(storageDir);
     }
 
@@ -337,12 +343,15 @@ public class ChunkServer {
     private Message buildHeartbeat(String type) {
         try {
             Map<String, Long> versions = storage.listWithVersions();
+            long freeBytes = storage.freeBytes();
             return new Message(type)
                 .put("host", host)
                 .put("port", port)
-                .put("chunkVersions", versions); // versions map sent instead of plain chunk set
+                .put("rackId", rackId)
+                .put("freeBytes", freeBytes)
+                .put("chunkVersions", versions);
         } catch (IOException e) {
-            return new Message(type).put("host", host).put("port", port);
+            return new Message(type).put("host", host).put("port", port).put("rackId", rackId);
         }
     }
 
@@ -362,9 +371,10 @@ public class ChunkServer {
     // -------------------------------------------------------------------------
 
     public static void main(String[] args) throws Exception {
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : GfsConfig.CHUNK_SERVER_BASE_PORT;
-        String dir = args.length > 1 ? args[1] : "chunk_data/node_" + port;
-        ChunkServer server = new ChunkServer("localhost", port, dir);
+        int    port   = args.length > 0 ? Integer.parseInt(args[0]) : GfsConfig.CHUNK_SERVER_BASE_PORT;
+        String dir    = args.length > 1 ? args[1] : "chunk_data/node_" + port;
+        String rackId = args.length > 2 ? args[2] : "default-rack";
+        ChunkServer server = new ChunkServer("localhost", port, dir, rackId);
         Runtime.getRuntime().addShutdownHook(new Thread(server::stop));
         server.start();
     }

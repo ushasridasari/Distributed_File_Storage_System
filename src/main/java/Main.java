@@ -123,10 +123,11 @@ public class Main {
             }
 
             case "chunkserver": {
-                requireArgs(args, 2, "chunkserver <port> [storage-dir]");
+                requireArgs(args, 2, "chunkserver <port> [storage-dir] [rack-id]");
                 int    port       = Integer.parseInt(args[1]);
                 String storageDir = args.length > 2 ? args[2] : "chunk_data/node_" + port;
-                ChunkServer cs = new ChunkServer("localhost", port, storageDir);
+                String rackId     = args.length > 3 ? args[3] : "default-rack";
+                ChunkServer cs = new ChunkServer("localhost", port, storageDir, rackId);
                 Runtime.getRuntime().addShutdownHook(new Thread(cs::stop));
                 cs.start();
                 break;
@@ -164,7 +165,7 @@ public class Main {
         System.out.println();
         System.out.println("Server startup:");
         System.out.println("  gfs master         [port]                  (default: 9000)");
-        System.out.println("  gfs chunkserver    <port> [storage-dir]    (default port: 9100)");
+        System.out.println("  gfs chunkserver    <port> [storage-dir] [rack-id]   (default port: 9100)");
         System.out.println();
         System.out.println("System properties:");
         System.out.println("  -Dgfs.master.host=<host>  (default: localhost)");

@@ -104,6 +104,8 @@ public class MasterServer {
     static class ServerInfo {
         ChunkLocation location;
         volatile long lastHeartbeat = System.currentTimeMillis();
+        volatile long freeBytes     = Long.MAX_VALUE; // reported by ChunkServer in heartbeat
+        String rackId = "default-rack";               // set on registration; used for rack-aware placement
         // chunkId -> reported version from heartbeat
         Map<String, Long> chunkVersions = new ConcurrentHashMap<>();
 
@@ -582,19 +584,21 @@ public class MasterServer {
     // -------------------------------------------------------------------------
 
     private Message registerServer(Message req) {
-        String host = (String) req.get("host");
-        int    port = (int)    req.get("port");
-        String key  = host + ":" + port;
+        String host   = (String) req.get("host");
+        int    port   = (int)    req.get("port");
+        String key    = host + ":" + port;
         ServerInfo info = new ServerInfo(new ChunkLocation(host, port));
 
-        // Populate reported chunk versions from the registration payload
+        if (req.has("rackId"))    info.rackId    = (String) req.get("rackId");
+        if (req.has("freeBytes")) info.freeBytes  = ((Number) req.get("freeBytes")).longValue();
         if (req.has("chunkVersions")) {
             Map<String, Long> versions = (Map<String, Long>) req.get("chunkVersions");
             info.chunkVersions.putAll(versions);
         }
         servers.put(key, info);
-        System.out.println("[Master] Registered chunk server " + key);
-        opLog.append("REGISTER_SERVER", key);
+        System.out.printf("[Master] Registered chunk server %s (rack=%s, free=%s)%n",
+            key, info.rackId, formatBytes(info.freeBytes));
+        opLog.append("REGISTER_SERVER", key + " rack=" + info.rackId);
         return Message.ok();
     }
 
@@ -606,6 +610,9 @@ public class MasterServer {
         ServerInfo info = servers.get(key);
         info.lastHeartbeat = System.currentTimeMillis();
 
+        if (req.has("freeBytes")) info.freeBytes = ((Number) req.get("freeBytes")).longValue();
+        if (req.has("rackId"))    info.rackId    = (String) req.get("rackId");
+
         // Update reported versions and evict stale replicas
         if (req.has("chunkVersions")) {
             Map<String, Long> reported = (Map<String, Long>) req.get("chunkVersions");
@@ -614,6 +621,13 @@ public class MasterServer {
             evictStaleReplicas(info, reported);
         }
         return Message.ok();
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes == Long.MAX_VALUE) return "unknown";
+        if (bytes >= 1L << 30) return String.format("%.1f GB", bytes / (double)(1L << 30));
+        if (bytes >= 1L << 20) return String.format("%.1f MB", bytes / (double)(1L << 20));
+        return bytes + " B";
     }
 
     /**
@@ -650,7 +664,9 @@ public class MasterServer {
         int totalDirs  = (int) namespace.values().stream().filter(m ->  m.isDirectory).count();
 
         return new Message("CLUSTER_STATUS")
-            .put("liveServers",  live.stream().map(s -> s.location.toString()).collect(Collectors.toList()))
+            .put("liveServers",  live.stream()
+                .map(s -> s.location + " rack=" + s.rackId + " free=" + formatBytes(s.freeBytes))
+                .collect(Collectors.toList()))
             .put("deadServers",  dead.stream().map(s -> s.location.toString()).collect(Collectors.toList()))
             .put("totalChunks",  chunkTable.size())
             .put("totalFiles",   totalFiles)
@@ -665,12 +681,43 @@ public class MasterServer {
         return servers.values().stream().filter(ServerInfo::isAlive).collect(Collectors.toList());
     }
 
+    /**
+     * Rack-aware, disk-space-aware server selection (GFS §3.1).
+     *
+     * Strategy:
+     *   1. Sort all live servers by free disk space descending (prefer roomier nodes).
+     *   2. Pick the first candidate unconditionally (most free space).
+     *   3. For each subsequent slot, prefer a server on a rack not yet used —
+     *      spreading replicas across racks so a single rack failure can't wipe
+     *      all copies. Fall back to any live server if not enough racks exist.
+     */
     private List<ChunkLocation> selectServers(int count) {
-        return liveServers().stream()
-            .sorted(Comparator.comparingInt(s -> s.chunkVersions.size()))
-            .limit(count)
-            .map(s -> s.location)
+        List<ServerInfo> candidates = liveServers().stream()
+            .sorted(Comparator.comparingLong((ServerInfo s) -> s.freeBytes).reversed())
             .collect(Collectors.toList());
+
+        List<ChunkLocation> selected = new ArrayList<>();
+        Set<String> usedRacks = new LinkedHashSet<>();
+
+        // First pass: pick one server per rack (rack-diverse replicas)
+        for (ServerInfo s : candidates) {
+            if (selected.size() >= count) break;
+            if (!usedRacks.contains(s.rackId)) {
+                selected.add(s.location);
+                usedRacks.add(s.rackId);
+            }
+        }
+
+        // Second pass: fill remaining slots from any live server not already selected
+        // (happens when there are fewer racks than REPLICATION_FACTOR)
+        for (ServerInfo s : candidates) {
+            if (selected.size() >= count) break;
+            if (!selected.contains(s.location)) {
+                selected.add(s.location);
+            }
+        }
+
+        return selected;
     }
 
     // -------------------------------------------------------------------------
