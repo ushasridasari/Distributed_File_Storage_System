@@ -7,14 +7,16 @@ import java.nio.file.*;
  */
 public class GfsConfig {
 
-    public static final int    CHUNK_SIZE_BYTES        = 64 * 1024 * 1024; // 64 MB (GFS paper default)
-    public static final int    REPLICATION_FACTOR      = 3;
-    public static final String MASTER_HOST             = "localhost";
-    public static final int    MASTER_PORT             = 9000;
-    public static final int    CHUNK_SERVER_BASE_PORT  = 9100;
-    public static final long   HEARTBEAT_INTERVAL_MS   = 5000;
-    public static final long   CHUNK_SERVER_TIMEOUT_MS = 15000;
-    public static final long   CACHE_TTL_MS            = 60000; // client-side chunk location cache TTL
+    public static final int    CHUNK_SIZE_BYTES         = 64 * 1024 * 1024; // 64 MB (GFS paper default)
+    public static final int    REPLICATION_FACTOR       = 3;
+    public static final String MASTER_HOST              = "localhost";
+    public static final int    MASTER_PORT              = 9000;
+    public static final int    CHUNK_SERVER_BASE_PORT   = 9100;
+    public static final long   HEARTBEAT_INTERVAL_MS    = 5000;
+    public static final long   CHUNK_SERVER_TIMEOUT_MS  = 15000;
+    public static final long   CACHE_TTL_MS             = 60000;  // client-side chunk location cache TTL
+    public static final long   LEASE_DURATION_MS        = 60000;  // chunk lease valid for 60 s (GFS paper §5.4)
+    public static final long   CHECKPOINT_INTERVAL_MS   = 300000; // master checkpoint every 5 min
 
     private static final String CONFIG_FILE = ".gfs/config";
 
@@ -25,11 +27,13 @@ public class GfsConfig {
 
         String defaults =
             "[core]\n" +
-            "\tmasterHost  = " + MASTER_HOST  + "\n" +
-            "\tmasterPort  = " + MASTER_PORT  + "\n" +
-            "\tchunkSize   = " + CHUNK_SIZE_BYTES + "\n" +
-            "\treplication = " + REPLICATION_FACTOR + "\n" +
-            "\tcacheTtlMs  = " + CACHE_TTL_MS + "\n";
+            "\tmasterHost       = " + MASTER_HOST            + "\n" +
+            "\tmasterPort       = " + MASTER_PORT            + "\n" +
+            "\tchunkSize        = " + CHUNK_SIZE_BYTES       + "\n" +
+            "\treplication      = " + REPLICATION_FACTOR     + "\n" +
+            "\tcacheTtlMs       = " + CACHE_TTL_MS           + "\n" +
+            "\tleaseDurationMs  = " + LEASE_DURATION_MS      + "\n" +
+            "\tcheckpointMs     = " + CHECKPOINT_INTERVAL_MS + "\n";
         Files.writeString(cfg, defaults);
     }
 
