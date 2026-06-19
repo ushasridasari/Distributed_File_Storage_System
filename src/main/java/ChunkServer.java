@@ -3,6 +3,7 @@ import java.net.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.zip.CRC32;
 
 /**
  * GFS ChunkServer — stores chunk data on local disk and serves clients.
@@ -10,19 +11,21 @@ import java.util.concurrent.*;
  * Mirrors how ObjectStore.java bundles all object read/write/compress logic
  * in the reference DVCS project. All chunk-server concerns live here:
  *   - Local disk storage (one flat file per chunk, named by UUID)
- *   - Read / write / delete request handling
+ *   - CRC32 checksums stored alongside each chunk for integrity verification
+ *   - Read / write / delete / append request handling
  *   - Replication forwarding to secondary servers
  *   - Heartbeat sender to keep the Master updated
  *
  * GFS paper responsibilities:
  *   - Store chunks as flat files
- *   - Serve read/write from clients (primary chains writes to secondaries)
+ *   - Serve read/write/append from clients (primary chains to secondaries)
+ *   - Detect and report data corruption via checksums
  *   - Send periodic heartbeats carrying the local chunk list
  */
 public class ChunkServer {
 
     // -------------------------------------------------------------------------
-    // Storage — flat files on local disk, one file per chunk
+    // Storage — flat files on local disk, one file per chunk + .crc sidecar
     // -------------------------------------------------------------------------
 
     static class ChunkStorage {
@@ -36,28 +39,73 @@ public class ChunkServer {
         void write(String chunkId, byte[] data) throws IOException {
             Files.write(dir.resolve(chunkId), data,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            writeCrc(chunkId, computeCrc(data));
+        }
+
+        // Atomic record append — appends data to the chunk file
+        void append(String chunkId, byte[] data) throws IOException {
+            Path p = dir.resolve(chunkId);
+            byte[] existing = Files.exists(p) ? Files.readAllBytes(p) : new byte[0];
+            byte[] combined = new byte[existing.length + data.length];
+            System.arraycopy(existing, 0, combined, 0, existing.length);
+            System.arraycopy(data, 0, combined, existing.length, data.length);
+            Files.write(p, combined, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            writeCrc(chunkId, computeCrc(combined));
         }
 
         byte[] read(String chunkId) throws IOException {
             Path p = dir.resolve(chunkId);
             if (!Files.exists(p)) throw new FileNotFoundException("Chunk not found: " + chunkId);
-            return Files.readAllBytes(p);
+            byte[] data = Files.readAllBytes(p);
+            verifyCrc(chunkId, data);
+            return data;
         }
 
         void delete(String chunkId) throws IOException {
             Files.deleteIfExists(dir.resolve(chunkId));
+            Files.deleteIfExists(dir.resolve(chunkId + ".crc"));
         }
 
         boolean has(String chunkId) {
             return Files.exists(dir.resolve(chunkId));
         }
 
+        long size(String chunkId) throws IOException {
+            Path p = dir.resolve(chunkId);
+            return Files.exists(p) ? Files.size(p) : 0;
+        }
+
         Set<String> list() throws IOException {
             Set<String> chunks = new HashSet<>();
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
-                for (Path entry : stream) chunks.add(entry.getFileName().toString());
+                for (Path entry : stream) {
+                    String name = entry.getFileName().toString();
+                    if (!name.endsWith(".crc")) chunks.add(name);
+                }
             }
             return chunks;
+        }
+
+        // CRC32 checksum helpers — detect silent data corruption
+        private long computeCrc(byte[] data) {
+            CRC32 crc = new CRC32();
+            crc.update(data);
+            return crc.getValue();
+        }
+
+        private void writeCrc(String chunkId, long crc) throws IOException {
+            Files.writeString(dir.resolve(chunkId + ".crc"), String.valueOf(crc),
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        }
+
+        private void verifyCrc(String chunkId, byte[] data) throws IOException {
+            Path crcFile = dir.resolve(chunkId + ".crc");
+            if (!Files.exists(crcFile)) return;
+            long stored  = Long.parseLong(Files.readString(crcFile).trim());
+            long computed = computeCrc(data);
+            if (stored != computed)
+                throw new IOException("Checksum mismatch for chunk " + chunkId +
+                    " (stored=" + stored + ", computed=" + computed + ")");
         }
     }
 
@@ -81,9 +129,11 @@ public class ChunkServer {
 
                 Message req = (Message) in.readObject();
                 switch (req.type) {
-                    case "WRITE_CHUNK":     handleWrite(req, out);     break;
-                    case "READ_CHUNK":      handleRead(req, out);      break;
-                    case "DELETE_CHUNK":    handleDelete(req, out);    break;
+                    case "WRITE_CHUNK":     handleWrite(req, out);   break;
+                    case "APPEND_CHUNK":    handleAppend(req, out);  break;
+                    case "READ_CHUNK":      handleRead(req, out);    break;
+                    case "DELETE_CHUNK":    handleDelete(req, out);  break;
+                    case "VERIFY_CHUNK":    handleVerify(req, out);  break;
                     case "REPLICATE_CHUNK": handleReplicate(req, out); break;
                     default:
                         out.writeObject(Message.error("Unknown: " + req.type));
@@ -104,14 +154,29 @@ public class ChunkServer {
             List<MasterServer.ChunkLocation> secondaries =
                 req.has("secondaries") ? (List<MasterServer.ChunkLocation>) req.get("secondaries") : new ArrayList<>();
             for (MasterServer.ChunkLocation loc : secondaries) {
-                replicateTo(chunkId, data, loc);
+                replicateTo("REPLICATE_CHUNK", chunkId, data, loc);
             }
             out.writeObject(Message.ok().put("chunkId", chunkId));
         }
 
+        private void handleAppend(Message req, ObjectOutputStream out) throws IOException {
+            String chunkId = (String) req.get("chunkId");
+            byte[] data    = (byte[]) req.get("data");
+            long offset    = storage.size(chunkId);
+            storage.append(chunkId, data);
+
+            // forward append to secondaries
+            List<MasterServer.ChunkLocation> secondaries =
+                req.has("secondaries") ? (List<MasterServer.ChunkLocation>) req.get("secondaries") : new ArrayList<>();
+            for (MasterServer.ChunkLocation loc : secondaries) {
+                replicateTo("REPLICATE_APPEND", chunkId, data, loc);
+            }
+            out.writeObject(Message.ok().put("chunkId", chunkId).put("offset", offset));
+        }
+
         private void handleRead(Message req, ObjectOutputStream out) throws IOException {
             String chunkId = (String) req.get("chunkId");
-            byte[] data = storage.read(chunkId);
+            byte[] data = storage.read(chunkId); // CRC verified inside
             out.writeObject(Message.ok().put("data", data));
         }
 
@@ -120,17 +185,34 @@ public class ChunkServer {
             out.writeObject(Message.ok());
         }
 
+        private void handleVerify(Message req, ObjectOutputStream out) throws IOException {
+            String chunkId = (String) req.get("chunkId");
+            try {
+                storage.read(chunkId); // triggers CRC check
+                out.writeObject(Message.ok().put("chunkId", chunkId).put("valid", true));
+            } catch (IOException e) {
+                out.writeObject(Message.ok().put("chunkId", chunkId).put("valid", false)
+                    .put("error", e.getMessage()));
+            }
+        }
+
         private void handleReplicate(Message req, ObjectOutputStream out) throws IOException {
-            storage.write((String) req.get("chunkId"), (byte[]) req.get("data"));
+            String chunkId = (String) req.get("chunkId");
+            byte[] data    = (byte[]) req.get("data");
+            if ("REPLICATE_APPEND".equals(req.type)) {
+                storage.append(chunkId, data);
+            } else {
+                storage.write(chunkId, data);
+            }
             out.writeObject(Message.ok());
         }
 
-        private void replicateTo(String chunkId, byte[] data, MasterServer.ChunkLocation loc) {
+        private void replicateTo(String msgType, String chunkId, byte[] data, MasterServer.ChunkLocation loc) {
             try (Socket s   = new Socket(loc.host, loc.port);
                  ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
                  ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
 
-                out.writeObject(new Message("REPLICATE_CHUNK")
+                out.writeObject(new Message(msgType)
                     .put("chunkId", chunkId)
                     .put("data", data));
                 in.readObject(); // consume ACK
