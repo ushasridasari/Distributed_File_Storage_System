@@ -12,24 +12,16 @@ import java.util.*;
  *   - Talk to Master for metadata (file info, chunk locations, lease grants)
  *   - Talk directly to ChunkServers for data
  *   - Split files into 64 MB chunks on upload; reassemble on download
- *   - Client-side chunk location cache to avoid hitting Master repeatedly
+ *   - Pass chunk version from lease to ChunkServer on every write
+ *   - Client-side chunk location cache (60 s TTL) to reduce Master load
  *
  * Operations:
  *   upload, download, append, delete, rename, mkdir, list, stat, clusterStatus
- *
- * GFS paper upload flow (§3.1):
- *   1. Ask Master to create file entry
- *   2. For each chunk: ask Master for a write lease → get primary + secondaries
- *   3. Send chunk data to primary; primary chains replication to secondaries
- *
- * GFS paper append flow (§3.3):
- *   1. Ask Master for the last chunk's lease (or allocate a new chunk)
- *   2. Send append data to primary; primary broadcasts to secondaries
  */
 public class GfsClient {
 
     // -------------------------------------------------------------------------
-    // Client-side chunk location cache (TTL-based, avoids hitting Master per read)
+    // Client-side chunk location cache (TTL-based)
     // -------------------------------------------------------------------------
 
     private static class CacheEntry {
@@ -47,8 +39,8 @@ public class GfsClient {
     private final Map<String, CacheEntry> locationCache = new HashMap<>();
 
     private List<MasterServer.ChunkLocation> getCachedLocations(String chunkId) {
-        CacheEntry entry = locationCache.get(chunkId);
-        return (entry != null && entry.isValid()) ? entry.locations : null;
+        CacheEntry e = locationCache.get(chunkId);
+        return (e != null && e.isValid()) ? e.locations : null;
     }
 
     private void cacheLocations(String chunkId, List<MasterServer.ChunkLocation> locs) {
@@ -62,9 +54,7 @@ public class GfsClient {
     private final String masterHost;
     private final int    masterPort;
 
-    public GfsClient() {
-        this(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT);
-    }
+    public GfsClient() { this(GfsConfig.MASTER_HOST, GfsConfig.MASTER_PORT); }
 
     public GfsClient(String masterHost, int masterPort) {
         this.masterHost = masterHost;
@@ -79,11 +69,9 @@ public class GfsClient {
         File file = new File(localPath);
         if (!file.exists()) throw new FileNotFoundException("Local file not found: " + localPath);
 
-        // 1. Create namespace entry on Master
         Message createResp = sendToMaster(new Message("CREATE_FILE").put("path", gfsPath));
         if ("ERROR".equals(createResp.type)) throw new IOException(createResp.get("error").toString());
 
-        // 2. Split file into 64 MB chunks and upload each
         byte[] fileBytes = readAllBytes(file);
         int totalChunks  = Math.max(1, (int) Math.ceil((double) fileBytes.length / GfsConfig.CHUNK_SIZE_BYTES));
 
@@ -95,13 +83,14 @@ public class GfsClient {
             Message lease = sendToMaster(new Message("REQUEST_CHUNK_WRITE").put("path", gfsPath));
             if ("ERROR".equals(lease.type)) throw new IOException(lease.get("error").toString());
 
-            String chunkId = (String) lease.get("chunkId");
-            MasterServer.ChunkLocation primary     = (MasterServer.ChunkLocation) lease.get("primary");
-            List<MasterServer.ChunkLocation> secs  = getSecondaries(lease);
+            String chunkId  = (String) lease.get("chunkId");
+            long   version  = lease.has("version") ? ((Number) lease.get("version")).longValue() : 1L;
+            MasterServer.ChunkLocation primary    = (MasterServer.ChunkLocation) lease.get("primary");
+            List<MasterServer.ChunkLocation> secs = getSecondaries(lease);
 
-            System.out.printf("[GfsClient] Uploading chunk %d/%d (id=%s) -> %s%n",
-                i + 1, totalChunks, chunkId, primary);
-            writeChunk(primary, secs, chunkId, chunkData);
+            System.out.printf("[GfsClient] Uploading chunk %d/%d (id=%s, v%d) -> %s%n",
+                i + 1, totalChunks, chunkId, version, primary);
+            writeChunk(primary, secs, chunkId, version, chunkData);
         }
         System.out.printf("[GfsClient] Upload complete: %s -> %s (%d chunk(s))%n",
             localPath, gfsPath, totalChunks);
@@ -118,19 +107,20 @@ public class GfsClient {
         try (FileOutputStream fos = new FileOutputStream(localPath)) {
             for (String chunkId : chunkIds) {
                 List<MasterServer.ChunkLocation> locations = resolveLocations(chunkId);
-                byte[] data = readChunk(locations.get(0), chunkId);
+                byte[] data = readChunkWithFallback(chunkId, locations);
                 fos.write(data);
             }
         }
         System.out.println("[GfsClient] Download complete: " + localPath);
     }
 
-    // Atomic record append (GFS §3.3) — appends data to an existing GFS file
+    // Atomic record append (GFS §3.3)
     public long append(String gfsPath, byte[] data) throws IOException {
         Message lease = sendToMaster(new Message("REQUEST_CHUNK_APPEND").put("path", gfsPath));
         if ("ERROR".equals(lease.type)) throw new IOException(lease.get("error").toString());
 
         String chunkId = (String) lease.get("chunkId");
+        long   version = lease.has("version") ? ((Number) lease.get("version")).longValue() : 1L;
         MasterServer.ChunkLocation primary    = (MasterServer.ChunkLocation) lease.get("primary");
         List<MasterServer.ChunkLocation> secs = getSecondaries(lease);
 
@@ -141,6 +131,7 @@ public class GfsClient {
             out.writeObject(new Message("APPEND_CHUNK")
                 .put("chunkId", chunkId)
                 .put("data", data)
+                .put("version", version)
                 .put("secondaries", secs));
             Message resp = (Message) in.readObject();
             if ("ERROR".equals(resp.type))
@@ -211,13 +202,14 @@ public class GfsClient {
 
     private void writeChunk(MasterServer.ChunkLocation primary,
                             List<MasterServer.ChunkLocation> secondaries,
-                            String chunkId, byte[] data) throws IOException {
+                            String chunkId, long version, byte[] data) throws IOException {
         try (Socket s   = new Socket(primary.host, primary.port);
              ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
              ObjectInputStream  in  = new ObjectInputStream(s.getInputStream())) {
 
             out.writeObject(new Message("WRITE_CHUNK")
                 .put("chunkId", chunkId)
+                .put("version", version)
                 .put("data", data)
                 .put("secondaries", secondaries));
             Message resp = (Message) in.readObject();
@@ -243,7 +235,22 @@ public class GfsClient {
         }
     }
 
-    // Resolve chunk locations using cache first, then Master
+    // Try each replica in order; skip stale/dead ones (GFS §3.1)
+    private byte[] readChunkWithFallback(String chunkId,
+                                         List<MasterServer.ChunkLocation> locations) throws IOException {
+        IOException last = null;
+        for (MasterServer.ChunkLocation loc : locations) {
+            try {
+                return readChunk(loc, chunkId);
+            } catch (IOException e) {
+                System.err.printf("[GfsClient] Replica %s failed for chunk %s, trying next%n", loc, chunkId);
+                last = e;
+                locationCache.remove(chunkId); // evict stale cache entry
+            }
+        }
+        throw new IOException("All replicas failed for chunk: " + chunkId, last);
+    }
+
     private List<MasterServer.ChunkLocation> resolveLocations(String chunkId) throws IOException {
         List<MasterServer.ChunkLocation> cached = getCachedLocations(chunkId);
         if (cached != null) return cached;
