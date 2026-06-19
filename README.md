@@ -82,6 +82,9 @@ src/
 | **Accurate file size tracking** | §2.6 | Master updates `FileMetadata.fileSize` via `UPDATE_FILE_SIZE` RPC after upload; `stat` reports the correct size |
 | **Disk-space-aware placement** | §3.1 | ChunkServers report free disk bytes in every heartbeat; Master sorts candidates by free space descending before selecting replica targets |
 | **Rack-aware placement** | §3.1 | Each ChunkServer declares a rack ID on startup; Master spreads the 3 replicas across distinct racks first, falling back to any live server when racks are fewer than replication factor |
+| **Socket timeouts** | §4 | All TCP sockets have explicit connect (5 s) and read (30 s) deadlines so a hung server never blocks the caller indefinitely |
+| **RPC retry with backoff** | §4 | Master RPCs, chunk writes, replication, and lease renewals retry up to 3 times with linear backoff (500 ms × attempt) before failing |
+| **Safe lease renewal** | §5.4 | Transient network errors during lease renewal no longer revoke the lease — only an explicit master rejection does |
 
 ## Quick Start
 
@@ -191,6 +194,10 @@ All defaults live in `GfsConfig.java` and are written to `.gfs/config` on first 
 | `LEASE_DURATION_MS` | 60000 | How long a write lease is valid (GFS §5.4) |
 | `CACHE_TTL_MS` | 60000 | Client-side chunk location cache lifetime |
 | `CHECKPOINT_INTERVAL_MS` | 300000 | How often the Master checkpoints namespace to disk |
+| `SOCKET_CONNECT_TIMEOUT_MS` | 5000 | TCP connect deadline; prevents hanging on unreachable hosts |
+| `SOCKET_READ_TIMEOUT_MS` | 30000 | Socket read deadline; prevents blocking on hung servers |
+| `RPC_MAX_RETRIES` | 3 | Retry attempts for Master RPCs, chunk writes, and replication |
+| `RPC_RETRY_DELAY_MS` | 500 | Base retry delay (multiplied by attempt number — linear backoff) |
 
 ## System Properties
 
