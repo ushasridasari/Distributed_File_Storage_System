@@ -9,12 +9,22 @@ import java.util.List;
  * the actual logic is delegated to GfsClient, MasterServer, and ChunkServer.
  *
  * Commands:
- *   gfs upload   <local-path> <gfs-path>     Upload a local file into GFS
- *   gfs download <gfs-path>   <local-path>   Download a GFS file locally
- *   gfs list     [prefix]                    List files under a path prefix
- *   gfs delete   <gfs-path>                  Delete a file from GFS
- *   gfs master   [port]                      Start the Master server
- *   gfs chunkserver <port> [storage-dir]     Start a Chunk server
+ *   --- File operations ---
+ *   gfs upload        <local-path> <gfs-path>    Upload a local file into GFS
+ *   gfs download      <gfs-path>   <local-path>  Download a GFS file locally
+ *   gfs append        <gfs-path>   <text>         Atomically append text to a file
+ *   gfs delete        <gfs-path>                  Delete a file from GFS
+ *   gfs rename        <src-path>   <dst-path>     Rename / move a file
+ *   gfs mkdir         <gfs-path>                  Create a directory in the namespace
+ *   gfs list          [prefix]                    List files under a path prefix
+ *   gfs stat          <gfs-path>                  Show file/directory metadata
+ *
+ *   --- Cluster info ---
+ *   gfs cluster-status                            Show live servers, chunk counts
+ *
+ *   --- Server startup ---
+ *   gfs master        [port]                      Start the Master server
+ *   gfs chunkserver   <port> [storage-dir]        Start a Chunk server
  */
 public class Main {
 
@@ -33,27 +43,49 @@ public class Main {
         switch (command) {
 
             // ------------------------------------------------------------------
-            // File operations (go through GfsClient -> Master -> ChunkServers)
+            // File operations
             // ------------------------------------------------------------------
 
             case "upload": {
                 requireArgs(args, 3, "upload <local-path> <gfs-path>");
-                GfsClient client = new GfsClient(masterHost, masterPort);
-                client.upload(args[1], args[2]);
+                new GfsClient(masterHost, masterPort).upload(args[1], args[2]);
                 break;
             }
 
             case "download": {
                 requireArgs(args, 3, "download <gfs-path> <local-path>");
-                GfsClient client = new GfsClient(masterHost, masterPort);
-                client.download(args[1], args[2]);
+                new GfsClient(masterHost, masterPort).download(args[1], args[2]);
+                break;
+            }
+
+            case "append": {
+                requireArgs(args, 3, "append <gfs-path> <text>");
+                byte[] data = args[2].getBytes();
+                new GfsClient(masterHost, masterPort).append(args[1], data);
+                break;
+            }
+
+            case "delete": {
+                requireArgs(args, 2, "delete <gfs-path>");
+                new GfsClient(masterHost, masterPort).deleteFile(args[1]);
+                break;
+            }
+
+            case "rename": {
+                requireArgs(args, 3, "rename <src-path> <dst-path>");
+                new GfsClient(masterHost, masterPort).rename(args[1], args[2]);
+                break;
+            }
+
+            case "mkdir": {
+                requireArgs(args, 2, "mkdir <gfs-path>");
+                new GfsClient(masterHost, masterPort).mkdir(args[1]);
                 break;
             }
 
             case "list": {
                 String prefix = args.length > 1 ? args[1] : "/";
-                GfsClient client = new GfsClient(masterHost, masterPort);
-                List<String> files = client.listFiles(prefix);
+                List<String> files = new GfsClient(masterHost, masterPort).listFiles(prefix);
                 if (files == null || files.isEmpty()) {
                     System.out.println("(no files)");
                 } else {
@@ -62,10 +94,18 @@ public class Main {
                 break;
             }
 
-            case "delete": {
-                requireArgs(args, 2, "delete <gfs-path>");
-                GfsClient client = new GfsClient(masterHost, masterPort);
-                client.deleteFile(args[1]);
+            case "stat": {
+                requireArgs(args, 2, "stat <gfs-path>");
+                new GfsClient(masterHost, masterPort).stat(args[1]);
+                break;
+            }
+
+            // ------------------------------------------------------------------
+            // Cluster info
+            // ------------------------------------------------------------------
+
+            case "cluster-status": {
+                new GfsClient(masterHost, masterPort).clusterStatus();
                 break;
             }
 
@@ -110,14 +150,21 @@ public class Main {
         System.out.println("GFS Java — Distributed File Storage System (GFS-inspired)");
         System.out.println();
         System.out.println("File operations:");
-        System.out.println("  gfs upload      <local-path> <gfs-path>");
-        System.out.println("  gfs download    <gfs-path>   <local-path>");
-        System.out.println("  gfs list        [prefix]");
-        System.out.println("  gfs delete      <gfs-path>");
+        System.out.println("  gfs upload         <local-path> <gfs-path>");
+        System.out.println("  gfs download       <gfs-path>   <local-path>");
+        System.out.println("  gfs append         <gfs-path>   <text>");
+        System.out.println("  gfs delete         <gfs-path>");
+        System.out.println("  gfs rename         <src-path>   <dst-path>");
+        System.out.println("  gfs mkdir          <gfs-path>");
+        System.out.println("  gfs list           [prefix]");
+        System.out.println("  gfs stat           <gfs-path>");
+        System.out.println();
+        System.out.println("Cluster:");
+        System.out.println("  gfs cluster-status");
         System.out.println();
         System.out.println("Server startup:");
-        System.out.println("  gfs master      [port]                   (default: 9000)");
-        System.out.println("  gfs chunkserver <port> [storage-dir]     (default port: 9100)");
+        System.out.println("  gfs master         [port]                  (default: 9000)");
+        System.out.println("  gfs chunkserver    <port> [storage-dir]    (default port: 9100)");
         System.out.println();
         System.out.println("System properties:");
         System.out.println("  -Dgfs.master.host=<host>  (default: localhost)");
