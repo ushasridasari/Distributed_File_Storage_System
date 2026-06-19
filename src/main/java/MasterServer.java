@@ -573,7 +573,7 @@ public class MasterServer {
                     return new Message("CHUNK_INFO")
                         .put("chunkId", cm.chunkId)
                         .put("primary", cm.primary)
-                        .put("secondaries", cm.locations.subList(1, cm.locations.size()))
+                        .put("secondaries", new ArrayList<>(cm.locations.subList(1, cm.locations.size())))
                         .put("append", true);
                 }
             }
@@ -625,7 +625,7 @@ public class MasterServer {
             .put("chunkId", chunkId)
             .put("version", version)
             .put("primary", cm.primary)
-            .put("secondaries", candidates.subList(1, candidates.size()))
+            .put("secondaries", new ArrayList<>(candidates.subList(1, candidates.size())))
             .put("leaseExpiry", cm.leaseGrantedAt + GfsConfig.LEASE_DURATION_MS);
     }
 
