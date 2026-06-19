@@ -6,3 +6,21 @@ target/
 *.iml
 .vscode/
 chunk_data/
+.gfs/
+
+# Unrelated projects in the same directory
+Distributed_File_Storage_System_Using_Python/
+GFS_Java/
+Leetcode_Solutions_Python/
+Redis_Protocol_implementation/
+Redis_Protocol_implementation_Python/
+cloudstorage/
+dfs/
+leetcode/
+
+# Loose files not part of this project
+TEST_COMMIT.md
+demo.py
+requirements.txt
+run_metadata_server.py
+run_storage_node.py
